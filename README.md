@@ -1,72 +1,50 @@
 # NFPD Ban Appeals Bot
 
-A Discord bot for managing ban appeals with a structured voting system, guild allowlist, and automatic developer notification for unauthorised server joins.
+A Discord bot for managing ban appeals: private ticket channels, a ban-team
+voting workflow, automatic verdicts, DM notifications, and a guild allowlist
+with automatic developer alerts on unapproved joins.
 
-## Setup
-
-### 1. Approve your server(s)
-
-Open `constants.py` and add your guild ID(s) to `APPROVED_GUILD_IDS`:
-
-```python
-APPROVED_GUILD_IDS: set[int] = {
-    123456789012345678,  # Your server ID
-}
-```
-
-If the bot joins any server not in this set, it will:
-1. Try to pull the inviter from the audit log
-2. Generate a temporary server invite
-3. DM the developer (ID `1285998518213017663`) with all details
-4. Send an unauthorised notice in the server
-5. Leave immediately
-
-### 2. Railway - add PostgreSQL
-
-In your Railway project: **+ New > Database > Add PostgreSQL**.
-`DATABASE_URL` is injected automatically - no config needed.
-
-### 3. Set environment variables
-
-| Variable | Value |
-|---|---|
-| `DISCORD_TOKEN` | Your bot token from the Discord Developer Portal |
-| `DATABASE_URL` | Auto-injected by Railway Postgres plugin |
-
-### 4. Enable Members Intent
-
-In the Discord Developer Portal, under your bot > Privileged Gateway Intents, enable **Server Members Intent**.
-
-### 5. Bot permissions
-
-The bot needs these permissions when added to a server:
-
-- View Channels / Read Messages
-- Send Messages
-- Manage Channels
-- Manage Messages
-- Embed Links
-- Ban Members
-- View Audit Log
-- Use Application Commands
-
-Invite scopes: `bot` + `applications.commands`
+Deployed self-hosted on Ubuntu with Docker Compose, connecting to an existing
+PostgreSQL 16 container over a shared Docker network.
 
 ---
 
-## First-time server setup
+## Environment
 
-```
-/setup
-  appeals_channel: #appeals-tickets
-  voting_channel:  #ban-team-votes
-  results_channel: #appeal-results
-  ban_team_role:   @Ban Team
+- Ubuntu 26.04 LTS (x86_64)
+- Docker + Docker Compose plugin
+- PostgreSQL 16 in an existing `appeals-postgres` container
+- Shared external Docker network: `nodey-monitoring`
+- Bot container: `nfpd-appeals-bot`, Python 3.12
 
-/createdashboard   <- run this in your public-facing appeals channel
-```
+The `docker-compose.yml` defines only the bot. It does **not** create the
+database; it connects to the existing `appeals-postgres` container through
+`nodey-monitoring`.
 
-Tables create themselves on first boot.
+---
+
+## Configuration (.env)
+
+Copy `.env.example` to `.env` and fill in the values. Every setting is loaded
+from environment variables; nothing lives in code.
+
+Key variables:
+
+| Variable | Purpose |
+|---|---|
+| `DISCORD_TOKEN` | Bot token |
+| `DATABASE_URL` | e.g. `postgresql://appeals:PASSWORD@appeals-postgres:5432/appeals` |
+| `APPROVED_GUILD_IDS` | Comma-separated guild IDs the bot may stay in |
+| `LEAVE_UNAPPROVED_GUILDS` | `true` (default) / `false` |
+| `DEVELOPER_IDS` | DM'd on unapproved joins |
+| `STAFF_ROLE_IDS` | Role IDs treated as Appeals staff for the new commands |
+| `BAN_TEAM_ROLE_IDS` | Extra role IDs allowed to vote |
+| `MINIMUM_VOTES` | Minimum votes for a valid result (default 3) |
+| `VOTING_HOURS` | Voting window length (default 48) |
+| `APPEAL_COOLDOWN_HOURS` | Post-verdict cooldown per user (default 0 = off) |
+| `DB_CONNECT_MAX_WAIT` | Startup wait for PostgreSQL (default 120s) |
+| `DB_POOL_MIN` / `DB_POOL_MAX` | asyncpg pool sizing |
+| `LOG_LEVEL` | INFO / DEBUG / WARNING / ERROR |
 
 ---
 
@@ -74,42 +52,62 @@ Tables create themselves on first boot.
 
 | Command | Permission | Description |
 |---|---|---|
-| `/setup` | Administrator | Set channels and ban team role |
-| `/createdashboard` | Administrator | Post the public appeal submission panel |
-| `/forwardtobanteam` | Manage Guild | Manually forward appeal to voting (run inside ticket channel) |
-| `/appealinfo <id>` | Manage Guild | View full case file and live vote tally |
+| `/setup` | Administrator | Set channels and ban-team role |
+| `/createdashboard` | Administrator | Post the public appeal panel |
+| `/forwardtobanteam` | Manage Guild | Manually forward an appeal to voting |
+| `/appealinfo <id>` | Manage Guild | View a case file and live vote tally |
+| `/force_end_voting <id>` | Appeals staff | End a live vote early using the same finalisation logic as the scheduled sweep |
+| `/user_appeal_history <user>` | Appeals staff | Show a user's appeal history and recent cases |
+| `/remove_cooldown <user>` | Appeals staff | End a user's appeal cooldown early |
+| `/debug` | Administrator | Full health check |
+
+Appeals staff = role in `STAFF_ROLE_IDS`, or the ban-team role configured via
+`/setup`, or Discord's `Manage Server`.
+
+---
+
+## Deployment
+
+First run:
+
+```bash
+cp .env.example .env
+$EDITOR .env
+docker compose build
+docker compose up -d
+docker compose logs -f nfpd-appeals-bot
+```
+
+Updates:
+
+```bash
+git pull
+docker compose build
+docker compose up -d
+```
+
+Rollback:
+
+```bash
+git checkout <previous-commit>
+docker compose build
+docker compose up -d
+```
+
+The database schema uses idempotent `ADD COLUMN IF NOT EXISTS` /
+`CREATE TABLE IF NOT EXISTS` migrations, so rolling back the image with the
+schema in place is safe.
 
 ---
 
 ## Appeal flow
 
 1. Member clicks **Submit a Ban Appeal** on the dashboard panel
-2. A modal pops up - Roblox username, Discord tag, reason for ban, appeal statement
-3. A private ticket channel is created; the member and bot can see it
-4. Staff click **Forward to Ban Team** (or use `/forwardtobanteam`)
-5. Appeal posts in the voting channel with a ban team role ping and live vote counters
-6. After 48 hours the background task checks votes:
-   - Fewer than 3 votes: inconclusive, appeal closed
-   - Unban wins: verdict posted with **Execute Unban** + **Close Ticket**
-   - Keep Banned wins: verdict posted with **Close Ticket** only
-7. Staff action the verdict; ticket channel deletes itself
-
----
-
-## File structure
-
-```
-bot.py             - Entry point, guild guard (on_guild_join)
-constants.py       - APPROVED_GUILD_IDS, brand colours, thresholds
-database.py        - asyncpg PostgreSQL layer
-cogs/
-  dashboard.py     - /setup, /createdashboard
-  appeals.py       - /forwardtobanteam, /appealinfo
-  voting.py        - Background task that finalises expired votes
-views/
-  appeal_panel.py  - Persistent dashboard button
-  appeal_modal.py  - Modal form + ticket channel creation
-  appeal_actions.py- Forward / Close Ticket buttons in ticket
-  voting_panel.py  - Unban / Keep Banned vote buttons
-  verdict_panel.py - Execute Unban / Close Ticket after voting ends
-```
+2. Modal captures the appeal
+3. A private ticket channel is created; the member and Ban Team can see it
+4. Staff click **Forward to Ban Team** (or run `/forwardtobanteam`)
+5. Appeal posts in the voting channel; live tally updates
+6. After `VOTING_HOURS` the scheduled task finalises, **or** an Appeals staff
+   member runs `/force_end_voting <id>` to close early. Both paths go through
+   the same `finalise_appeal()` function, so the outcome is identical.
+7. Staff action the verdict; the ticket channel is transcribed and deleted.

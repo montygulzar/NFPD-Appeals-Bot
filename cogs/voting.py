@@ -1,26 +1,44 @@
+import asyncio
 import logging
+from typing import Optional
 
 import discord
 from discord.ext import commands, tasks
 
 from config import (
+    APPEAL_COOLDOWN_HOURS,
     BOT_AVATAR_URL,
     MINIMUM_VOTES,
-    VOTING_HOURS,
     COLOUR_ACCEPTED,
     COLOUR_REJECTED,
     COLOUR_CLOSED,
-    COLOUR_VOTING,
-    COLOUR_PRIMARY,
 )
 
 logger = logging.getLogger("appeals-bot.voting")
 
 
+class FinaliseResult:
+    """Outcome of a finalisation attempt."""
+
+    __slots__ = ("won_claim", "verdict", "tally", "total_votes")
+
+    def __init__(self, won_claim: bool, verdict: Optional[str], tally: dict, total_votes: int):
+        self.won_claim = won_claim
+        self.verdict = verdict            # 'accepted' | 'rejected' | 'inconclusive' | None
+        self.tally = tally
+        self.total_votes = total_votes
+
+
 class VotingCog(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
-        self.check_expired_votes.start()
+
+    async def cog_load(self):
+        # Start the scheduled sweep as part of cog load, not __init__.
+        # Prevents accidental double-starts if the cog is reloaded, and defers
+        # starting until the bot is actually ready (via before_loop).
+        if not self.check_expired_votes.is_running():
+            self.check_expired_votes.start()
 
     def cog_unload(self):
         self.check_expired_votes.cancel()
@@ -40,71 +58,128 @@ class VotingCog(commands.Cog):
         expired = await self.bot.db.get_appeals_due_for_verdict()
         for appeal in expired:
             try:
-                await self._finalise_appeal(appeal)
+                await finalise_appeal(self.bot, appeal, actor_id=None, force=False)
             except Exception:
-                logger.exception(f"Failed to finalise appeal {appeal['id']}")
+                logger.exception("Failed to finalise appeal %s", appeal["id"])
 
-    async def _finalise_appeal(self, appeal):
-        db = self.bot.db
-        appeal_id = appeal["id"]
 
+# ---------------------------------------------------------------------------
+# Public finalisation entry point
+# ---------------------------------------------------------------------------
+
+async def finalise_appeal(
+    bot,
+    appeal,
+    *,
+    actor_id: Optional[int] = None,
+    force: bool = False,
+) -> FinaliseResult:
+    """The single source of truth for closing out a vote.
+
+    Called both by the scheduled sweep (when closes_at has passed) and by
+    /force_end_voting. Uses a conditional UPDATE to atomically claim the
+    appeal so two simultaneous callers cannot both finalise it and cannot
+    both post results.
+
+    ``force`` only affects how the "inconclusive" vs "verdict" decision is
+    described in the DM and result embed - the actual vote arithmetic is
+    exactly the same in both paths so a staff force-end can never change the
+    outcome relative to letting the timer run out.
+    """
+    db = bot.db
+    appeal_id = appeal["id"]
+
+    claimed = await db.claim_for_finalisation(appeal_id, actor_id=actor_id)
+    if not claimed:
+        # Someone else got here first - refetch so the caller can render a
+        # useful message. verdict==None signals "did not perform the finalise".
+        fresh = await db.get_appeal(appeal_id)
         tally = await db.get_vote_tally(appeal_id)
-        total_votes = tally["unban"] + tally["keep_banned"]
+        return FinaliseResult(
+            won_claim=False,
+            verdict=(fresh["status"] if fresh else None),
+            tally=tally,
+            total_votes=tally["unban"] + tally["keep_banned"],
+        )
 
-        config = await db.get_guild_config(appeal["guild_id"])
-        if not config:
-            logger.warning(f"No config for guild {appeal['guild_id']}, skipping appeal {appeal_id}")
-            return
+    # We own the finalisation from here.
+    tally = await db.get_vote_tally(appeal_id)
+    total_votes = tally["unban"] + tally["keep_banned"]
 
-        guild = self.bot.get_guild(appeal["guild_id"])
-        if not guild:
-            return
+    config = await db.get_guild_config(appeal["guild_id"])
+    guild = bot.get_guild(appeal["guild_id"])
 
-        results_channel = guild.get_channel(config["results_channel"]) if config["results_channel"] else None
-        ticket_channel = guild.get_channel(appeal["ticket_channel"]) if appeal["ticket_channel"] else None
-
+    results_channel = None
+    ticket_channel = None
+    if guild and config:
+        if config["results_channel"]:
+            results_channel = guild.get_channel(config["results_channel"])
+        if appeal["ticket_channel"]:
+            ticket_channel = guild.get_channel(appeal["ticket_channel"])
         await _disable_voting_message(guild, config, appeal)
 
-        if total_votes < MINIMUM_VOTES:
-            embed = _build_inconclusive_embed(appeal, tally, total_votes)
-            if results_channel:
-                await results_channel.send(embed=embed)
-            if ticket_channel:
-                await ticket_channel.send(embed=embed)
-            await db.close_appeal(appeal_id, "closed")
-            await _dm_appellant(self.bot, appeal, verdict="inconclusive")
-            return
+    if total_votes < MINIMUM_VOTES:
+        embed = _build_inconclusive_embed(appeal, tally, total_votes, forced=force)
+        for ch in (results_channel, ticket_channel):
+            if ch is not None:
+                try:
+                    await ch.send(embed=embed)
+                except discord.HTTPException:
+                    logger.warning("Could not post inconclusive result for appeal %s", appeal_id)
+        await db.close_appeal(appeal_id, "closed")
+        await _apply_cooldown(db, appeal, "Appeal closed inconclusively")
+        await _dm_appellant(bot, appeal, verdict="inconclusive")
+        return FinaliseResult(True, "closed", tally, total_votes)
 
-        unban_wins = tally["unban"] > tally["keep_banned"]
-        verdict = "accepted" if unban_wins else "rejected"
+    unban_wins = tally["unban"] > tally["keep_banned"]
+    verdict = "accepted" if unban_wins else "rejected"
+    embed = _build_verdict_embed(appeal, tally, total_votes, unban_wins, forced=force)
 
-        embed = _build_verdict_embed(appeal, tally, total_votes, unban_wins)
+    from views.verdict_panel import VerdictPanelView
+    ban_team_mention = (
+        f"<@&{config['ban_team_role']}>" if config and config["ban_team_role"] else None
+    )
 
-        from views.verdict_panel import VerdictPanelView
-
-        ban_team_mention = f"<@&{config['ban_team_role']}>" if config["ban_team_role"] else None
-
-        if results_channel:
-            await results_channel.send(
-                content=ban_team_mention,
+    for ch in (results_channel, ticket_channel):
+        if ch is None:
+            continue
+        try:
+            await ch.send(
+                content=ban_team_mention if ch is results_channel else None,
                 embed=embed,
-                view=VerdictPanelView(self.bot, appeal_id),
+                view=VerdictPanelView(bot, appeal_id),
             )
-        if ticket_channel:
-            await ticket_channel.send(
-                embed=embed,
-                view=VerdictPanelView(self.bot, appeal_id),
-            )
+        except discord.HTTPException:
+            logger.warning("Could not post verdict for appeal %s in %s", appeal_id, ch.id)
 
-        await db.close_appeal(appeal_id, verdict)
-        await _dm_appellant(self.bot, appeal, verdict=verdict)
+    await db.close_appeal(appeal_id, verdict)
+    await _apply_cooldown(
+        db, appeal,
+        "Appeal accepted" if unban_wins else "Appeal rejected",
+    )
+    await _dm_appellant(bot, appeal, verdict=verdict)
+    return FinaliseResult(True, verdict, tally, total_votes)
 
+
+async def _apply_cooldown(db, appeal, reason: str) -> None:
+    if APPEAL_COOLDOWN_HOURS <= 0:
+        return
+    try:
+        await db.set_cooldown(appeal["guild_id"], appeal["appellant_id"], APPEAL_COOLDOWN_HOURS, reason)
+    except Exception:
+        logger.exception("Failed to set cooldown for user %s", appeal["appellant_id"])
+
+
+# ---------------------------------------------------------------------------
+# Embed / DM helpers
+# ---------------------------------------------------------------------------
 
 async def _dm_appellant(bot, appeal, *, verdict: str) -> None:
-    """DM the appellant with the outcome of their appeal."""
+    # Courtesy DM only - must never take down the finalisation path.
     try:
         user = await bot.fetch_user(appeal["appellant_id"])
-    except discord.HTTPException:
+    except Exception:
+        logger.debug("Could not fetch user %s to DM verdict", appeal["appellant_id"])
         return
 
     if verdict == "accepted":
@@ -117,8 +192,6 @@ async def _dm_appellant(bot, appeal, *, verdict: str) -> None:
             ),
             color=COLOUR_ACCEPTED,
         )
-        embed.set_footer(text=f"Appeal #{appeal['id']}  |  NFPD Ban Appeals")
-
     elif verdict == "rejected":
         embed = discord.Embed(
             title="Ban Appeal - Rejected",
@@ -130,32 +203,29 @@ async def _dm_appellant(bot, appeal, *, verdict: str) -> None:
             ),
             color=COLOUR_REJECTED,
         )
-        embed.set_footer(text=f"Appeal #{appeal['id']}  |  NFPD Ban Appeals")
-
     else:  # inconclusive
         embed = discord.Embed(
             title="Ban Appeal - Inconclusive",
             description=(
-                "Your ban appeal did not receive enough votes within the 48-hour window to reach a valid result.\n\n"
+                "Your ban appeal did not receive enough votes within the voting window to reach a valid result.\n\n"
                 f"A minimum of **{MINIMUM_VOTES} votes** is required. Your appeal has been closed without a verdict.\n\n"
                 "Staff may reopen your appeal manually. If you have questions, please contact a staff member."
             ),
             color=COLOUR_CLOSED,
         )
-        embed.set_footer(text=f"Appeal #{appeal['id']}  |  NFPD Ban Appeals")
 
+    embed.set_footer(text=f"Appeal #{appeal['id']}  |  NFPD Ban Appeals")
     embed.add_field(name="Roblox Username", value=f"`{appeal['roblox_username']}`", inline=True)
     embed.add_field(name="Appeal ID", value=str(appeal["id"]), inline=True)
     embed.timestamp = discord.utils.utcnow()
 
     try:
         await user.send(embed=embed)
-    except discord.HTTPException:
-        # DMs closed or blocked - not a fatal error
-        logger.debug(f"Could not DM appellant {appeal['appellant_id']} for appeal {appeal['id']}")
+    except Exception:
+        logger.debug("Could not DM appellant %s for appeal %s", appeal["appellant_id"], appeal["id"])
 
 
-def _build_verdict_embed(appeal, tally: dict, total_votes: int, unban_wins: bool) -> discord.Embed:
+def _build_verdict_embed(appeal, tally: dict, total_votes: int, unban_wins: bool, *, forced: bool = False) -> discord.Embed:
     from views.voting_panel import _build_vote_bar
     colour = COLOUR_ACCEPTED if unban_wins else COLOUR_REJECTED
     outcome = "UNBAN APPROVED" if unban_wins else "KEEP BANNED"
@@ -166,9 +236,10 @@ def _build_verdict_embed(appeal, tally: dict, total_votes: int, unban_wins: bool
         if unban_wins
         else "Use **Close Ticket** to formally close this appeal."
     )
+    title_prefix = "Voting Force-Ended" if forced else "Voting Closed"
 
     embed = discord.Embed(
-        title=f"{icon}  Voting Closed  —  {outcome}",
+        title=f"{icon}  {title_prefix}  —  {outcome}",
         description=(
             f"The voting window for Appeal #{appeal['id']} has closed.\n\n"
             f"{action}"
@@ -187,17 +258,20 @@ def _build_verdict_embed(appeal, tally: dict, total_votes: int, unban_wins: bool
         ),
         inline=False,
     )
-    embed.set_footer(text=f"Appeal ID: {appeal['id']}  •  Voting closed")
+    footer = f"Appeal ID: {appeal['id']}  •  "
+    footer += "Voting force-ended by staff" if forced else "Voting closed"
+    embed.set_footer(text=footer)
     embed.timestamp = discord.utils.utcnow()
     return embed
 
 
-def _build_inconclusive_embed(appeal, tally: dict, total_votes: int) -> discord.Embed:
+def _build_inconclusive_embed(appeal, tally: dict, total_votes: int, *, forced: bool = False) -> discord.Embed:
+    title = "⚫  Voting Force-Ended  -  INCONCLUSIVE" if forced else "⚫  Voting Closed  -  INCONCLUSIVE"
     embed = discord.Embed(
-        title="⚫  Voting Closed  -  INCONCLUSIVE",
+        title=title,
         description=(
             f"Appeal #{appeal['id']} did not reach the minimum **{MINIMUM_VOTES} votes** required for a valid result.\n\n"
-            f"Only **{total_votes}** vote(s) were cast within the 48-hour window. "
+            f"Only **{total_votes}** vote(s) were cast. "
             "This appeal has been closed without a verdict. Staff may reopen it manually if required."
         ),
         color=COLOUR_CLOSED,
@@ -223,8 +297,9 @@ async def _disable_voting_message(guild: discord.Guild, config, appeal):
         return
     try:
         msg = await voting_channel.fetch_message(appeal["voting_msg_id"])
-        embed = msg.embeds[0]
-        embed.color = discord.Color(COLOUR_CLOSED)
+        embed = msg.embeds[0] if msg.embeds else None
+        if embed is not None:
+            embed.color = discord.Color(COLOUR_CLOSED)
         await msg.edit(embed=embed, view=None)
     except (discord.NotFound, discord.HTTPException):
         pass
