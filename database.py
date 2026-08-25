@@ -13,6 +13,12 @@ TERMINAL_STATUSES = frozenset({
     "accepted", "rejected", "closed", "actioned_unban", "actioned_close",
 })
 
+# Non-final statuses. An appeal in any of these is "still in progress" from
+# the user's perspective and blocks them from opening another appeal.
+# 'finalising' is a short-lived transitional state; it appears here so a
+# crash during finalisation does not free the slot before recovery runs.
+ACTIVE_STATUSES = frozenset({"open", "voting", "finalising"})
+
 
 class Database:
     """Thin wrapper around an asyncpg connection pool.
@@ -134,19 +140,41 @@ class Database:
             await conn.execute(
                 "ALTER TABLE appeals ADD COLUMN IF NOT EXISTS finalised_by BIGINT"
             )
+            # computed_verdict: the verdict decided at claim time, before any
+            # Discord side effect runs. Persisting it means that if the bot
+            # crashes mid-finalisation the recovery pass can drive the row to
+            # the correct terminal status without re-running any side effects
+            # or re-computing the tally.
+            await conn.execute(
+                "ALTER TABLE appeals ADD COLUMN IF NOT EXISTS computed_verdict TEXT"
+            )
 
-            # Partial unique index: at most one *active* appeal (open or voting)
-            # per user per guild. Blocks the modal-side double-submit race and
-            # cleanly permits historical rows in closed states.
+            # Pre-migration integrity check. We are about to widen the
+            # active-appeal unique index to cover status IN
+            # ('open','voting','finalising'). If any user already has more
+            # than one row in that set (impossible under normal operation
+            # but possible after an unclean earlier deployment), creating
+            # the index would fail and leave the bot crash-looping.
+            #
+            # We refuse to start with a clear, actionable error rather than
+            # partially migrating or silently changing production data.
+            conflicts = await find_active_appeal_conflicts(conn)
+            if conflicts:
+                raise RuntimeError(_format_conflict_error(conflicts))
+
+            # Partial unique index: at most one *active* appeal per user per
+            # guild. Blocks the modal-side double-submit race and cleanly
+            # permits historical rows in closed states.
             #
             # An older deployment had this restricted to status='open' only;
-            # migrate by dropping it if present, then recreating with the wider
-            # predicate. Both operations are idempotent.
+            # migrate by dropping it if present, then recreating with the
+            # wider predicate. Both operations are idempotent.
             await conn.execute("DROP INDEX IF EXISTS appeals_one_open_per_user")
+            await conn.execute("DROP INDEX IF EXISTS appeals_one_active_per_user")
             await conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS appeals_one_active_per_user
+                CREATE UNIQUE INDEX IF NOT EXISTS appeals_one_active_per_user_v2
                 ON appeals (guild_id, appellant_id)
-                WHERE status IN ('open', 'voting')
+                WHERE status IN ('open', 'voting', 'finalising')
             """)
 
             await conn.execute("""
@@ -211,12 +239,12 @@ class Database:
     # ------------------------------------------------------------------ #
 
     async def get_active_appeal_for_user(self, guild_id: int, user_id: int) -> Optional[asyncpg.Record]:
-        """Returns an appeal in 'open' or 'voting' status, if any."""
+        """Returns an appeal in any non-terminal status (open/voting/finalising)."""
         async with self._pool.acquire() as conn:
             return await conn.fetchrow(
                 "SELECT * FROM appeals "
                 "WHERE guild_id = $1 AND appellant_id = $2 "
-                "  AND status IN ('open', 'voting')",
+                "  AND status IN ('open', 'voting', 'finalising')",
                 guild_id,
                 user_id,
             )
@@ -282,27 +310,111 @@ class Database:
     async def set_appeal_voting(self, appeal_id: int, voting_msg_id: int, closes_at):
         await self.claim_open_for_voting(appeal_id, voting_msg_id, closes_at)
 
-    async def claim_for_finalisation(self, appeal_id: int, actor_id: Optional[int] = None) -> bool:
-        """Atomically mark a 'voting' appeal as being finalised right now.
+    async def claim_for_finalisation(
+        self,
+        appeal_id: int,
+        *,
+        minimum_votes: int,
+        actor_id: Optional[int] = None,
+    ) -> Optional[dict]:
+        """Atomically claim a 'voting' appeal and record its computed verdict.
 
-        Uses a conditional UPDATE so exactly one of many concurrent finalisers
-        (the scheduled task, /force_end_voting) wins. The winning call proceeds
-        to compute and post the verdict; losers get False and back off.
+        Runs entirely inside a serialisable transaction with SELECT FOR UPDATE
+        so exactly one of many concurrent finalisers wins. Losers get None.
 
-        The status is set to 'finalising' (a short-lived transitional state)
-        and the caller is expected to call close_appeal() with the terminal
-        status once the verdict computation is done.
+        The verdict is decided from the tally *before* any Discord side effect
+        runs and is persisted alongside the 'finalising' status transition, so
+        a crash between the claim and close_appeal() cannot lose or change the
+        decision - the recovery pass has everything it needs to drive the row
+        to its final status without re-computing anything and without
+        re-running any non-idempotent side effect.
+
+        Returns None if the claim did not win. Otherwise returns:
+            {'verdict': 'accepted'|'rejected'|'closed',
+             'tally':   {'unban': N, 'keep_banned': N},
+             'total':   int}
+        """
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                row = await conn.fetchrow(
+                    "SELECT status FROM appeals WHERE id = $1 FOR UPDATE",
+                    appeal_id,
+                )
+                if row is None or row["status"] != "voting":
+                    return None
+
+                vote_rows = await conn.fetch(
+                    "SELECT vote, COUNT(*) AS c FROM votes "
+                    "WHERE appeal_id = $1 GROUP BY vote",
+                    appeal_id,
+                )
+                tally = {"unban": 0, "keep_banned": 0}
+                for r in vote_rows:
+                    tally[r["vote"]] = r["c"]
+                total = tally["unban"] + tally["keep_banned"]
+
+                if total < minimum_votes:
+                    verdict = "closed"
+                elif tally["unban"] > tally["keep_banned"]:
+                    verdict = "accepted"
+                else:
+                    verdict = "rejected"
+
+                await conn.execute(
+                    "UPDATE appeals SET status = 'finalising', "
+                    "                   computed_verdict = $1, "
+                    "                   finalised_at = NOW(), "
+                    "                   finalised_by = COALESCE($2, finalised_by) "
+                    "WHERE id = $3",
+                    verdict, actor_id, appeal_id,
+                )
+                return {"verdict": verdict, "tally": tally, "total": total}
+
+    async def find_abandoned_finalisations(self, *, stale_after_seconds: int = 300):
+        """Return appeals stuck in 'finalising' for longer than the threshold.
+
+        Under normal operation the transition finalising -> terminal takes
+        well under a second. Anything older than a few minutes is an abandoned
+        finalisation (bot crashed, container restarted, network died) that
+        must be recovered by the startup / periodic recovery pass rather than
+        left permanently stranded.
+        """
+        async with self._pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT id, guild_id, appellant_id, computed_verdict, "
+                "       finalised_at, finalised_by "
+                "FROM appeals "
+                "WHERE status = 'finalising' "
+                "  AND finalised_at IS NOT NULL "
+                "  AND finalised_at < NOW() - ($1 || ' seconds')::interval "
+                "ORDER BY id",
+                str(int(stale_after_seconds)),
+            )
+
+    async def recover_finalisation(self, appeal_id: int) -> Optional[str]:
+        """Force an abandoned 'finalising' row to its recorded terminal status.
+
+        Uses the verdict that was computed and stored atomically at claim
+        time, so this involves no re-running of Discord side effects (no
+        duplicate embeds, no duplicate DMs) and no re-computation of the
+        tally. If computed_verdict is somehow NULL (should not happen with
+        the new claim path), we fall back to 'closed' to avoid a permanent
+        stuck row and log a warning at the caller.
+
+        Returns the terminal status the row was moved to, or None if the row
+        was no longer in 'finalising' when we tried (someone else fixed it).
         """
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 "UPDATE appeals "
-                "SET status = 'finalising', finalised_at = NOW(), "
-                "    finalised_by = COALESCE($2, finalised_by) "
-                "WHERE id = $1 AND status = 'voting' "
-                "RETURNING id",
-                appeal_id, actor_id,
+                "SET status = COALESCE(computed_verdict, 'closed') "
+                "WHERE id = $1 AND status = 'finalising' "
+                "RETURNING status, computed_verdict",
+                appeal_id,
             )
-            return row is not None
+            if row is None:
+                return None
+            return row["status"]
 
     async def close_appeal(self, appeal_id: int, status: str):
         """
@@ -429,3 +541,50 @@ class Database:
                 guild_id, user_id,
             )
             return row is not None
+
+
+# ---------------------------------------------------------------------------
+# Module-level migration helpers (used by _create_tables and by tests)
+# ---------------------------------------------------------------------------
+
+async def find_active_appeal_conflicts(conn) -> list:
+    """Return groups where the widened unique index would be violated.
+
+    Result rows: (guild_id, appellant_id, ids[list of ints]).
+    """
+    rows = await conn.fetch(
+        "SELECT guild_id, appellant_id, "
+        "       array_agg(id ORDER BY id) AS ids, "
+        "       array_agg(status ORDER BY id) AS statuses "
+        "FROM appeals "
+        "WHERE status IN ('open', 'voting', 'finalising') "
+        "GROUP BY guild_id, appellant_id "
+        "HAVING COUNT(*) > 1"
+    )
+    return [dict(r) for r in rows]
+
+
+def _format_conflict_error(conflicts: list) -> str:
+    lines = [
+        "Refusing to create appeals_one_active_per_user_v2 unique index: the "
+        "existing production data already violates it. This means one or more "
+        "users currently have more than one non-terminal appeal on record, "
+        "which should not happen under normal operation.",
+        "",
+        "Conflicting groups (guild_id, appellant_id, appeal ids, statuses):",
+    ]
+    for c in conflicts[:20]:
+        lines.append(
+            f"  guild={c['guild_id']} user={c['appellant_id']} "
+            f"ids={c['ids']} statuses={c['statuses']}"
+        )
+    if len(conflicts) > 20:
+        lines.append(f"  ... and {len(conflicts) - 20} more.")
+    lines += [
+        "",
+        "The bot has NOT modified any appeals. Resolve the conflicts by "
+        "manually closing the stale row(s) via psql, e.g.:",
+        "  UPDATE appeals SET status='closed' WHERE id=<older-id>;",
+        "then restart the container.",
+    ]
+    return "\n".join(lines)
