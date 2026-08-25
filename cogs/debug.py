@@ -39,10 +39,17 @@ class DebugCog(commands.Cog):
 
             # 3. Channel permission checks
             channel_checks = {
-                "Appeals channel": (config["appeals_channel"], ["view_channel", "send_messages", "manage_channels"]),
-                "Voting channel":  (config["voting_channel"],  ["view_channel", "send_messages", "embed_links"]),
-                "Results channel": (config["results_channel"], ["view_channel", "send_messages", "embed_links", "attach_files"]),
+                "Dashboard channel": (config["appeals_channel"], ["view_channel", "send_messages"]),
+                "Voting channel":    (config["voting_channel"],  ["view_channel", "send_messages", "embed_links"]),
+                "Results channel":   (config["results_channel"], ["view_channel", "send_messages", "embed_links", "attach_files"]),
             }
+            if config["transcripts_channel"]:
+                channel_checks["Transcripts channel"] = (
+                    config["transcripts_channel"],
+                    ["view_channel", "send_messages", "embed_links", "attach_files"],
+                )
+            else:
+                results.append("Transcripts channel: not configured (falls back to results channel)")
             for label, (channel_id, required_perms) in channel_checks.items():
                 if not channel_id:
                     results.append(f"{label}: not configured")
@@ -73,6 +80,22 @@ class DebugCog(commands.Cog):
                         results.append(f"Voting channel edit test: FAIL (Forbidden) - {exc}")
                     except discord.HTTPException as exc:
                         results.append(f"Voting channel edit test: FAIL - {exc}")
+
+            # Ticket category
+            tc_id = config["ticket_category"]
+            if not tc_id:
+                results.append("Ticket category: NOT configured - staff must re-run /setup")
+            else:
+                cat = interaction.guild.get_channel(tc_id)
+                if not isinstance(cat, discord.CategoryChannel):
+                    results.append(f"Ticket category: configured (ID {tc_id}) but not found or not a category")
+                else:
+                    me = interaction.guild.me
+                    perms = cat.permissions_for(me)
+                    if not perms.manage_channels:
+                        results.append(f"Ticket category: {cat.name} - missing manage_channels")
+                    else:
+                        results.append(f"Ticket category: {cat.name} - OK")
 
             # 5. Ban team role
             if not config["ban_team_role"]:

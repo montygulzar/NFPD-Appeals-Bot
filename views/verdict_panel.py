@@ -129,18 +129,19 @@ async def _close_ticket_channel(
     # Generate and post the transcript before the channel is deleted.
     try:
         config = await bot.db.get_guild_config(appeal["guild_id"])
-        if config and config["results_channel"]:
-            results_channel = channel.guild.get_channel(config["results_channel"])
-            if results_channel is None:
-                try:
-                    results_channel = await channel.guild.fetch_channel(config["results_channel"])
-                except discord.HTTPException:
-                    logger.warning("Could not find results channel %s", config["results_channel"])
-            if results_channel:
-                from views.transcript import build_transcript_embed, generate_transcript
-                transcript_file = await generate_transcript(channel, appeal)
-                transcript_embed = build_transcript_embed(appeal, closed_by, reason)
-                await results_channel.send(embed=transcript_embed, file=transcript_file)
+        from views.transcript import (
+            build_transcript_embed, generate_transcript, resolve_transcripts_channel,
+        )
+        target = await resolve_transcripts_channel(channel.guild, config)
+        if target is None:
+            logger.warning(
+                "No transcripts destination for appeal %s (neither transcripts_channel "
+                "nor results_channel resolves).", appeal["id"],
+            )
+        else:
+            transcript_file = await generate_transcript(channel, appeal)
+            transcript_embed = build_transcript_embed(appeal, closed_by, reason)
+            await target.send(embed=transcript_embed, file=transcript_file)
     except Exception:
         logger.exception("Failed to generate or post transcript for appeal %s", appeal["id"])
 

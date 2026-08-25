@@ -1,9 +1,41 @@
 import io
+import logging
 from datetime import datetime, timezone
+from typing import Optional
 
 import discord
 
 from config import BOT_AVATAR_URL, COLOUR_CLOSED
+
+logger = logging.getLogger("appeals-bot.transcript")
+
+
+async def resolve_transcripts_channel(
+    guild: discord.Guild,
+    config,
+) -> Optional[discord.TextChannel]:
+    """Return the channel a ticket transcript should be posted in.
+
+    Prefers guild_config.transcripts_channel; falls back to
+    guild_config.results_channel when transcripts_channel is NULL (i.e.
+    the server has not opted into split-channel transcripts). Missing/
+    unreachable channels return None so the caller can log and skip.
+    """
+    if config is None:
+        return None
+    for column in ("transcripts_channel", "results_channel"):
+        cid = config[column] if column in config.keys() else None
+        if not cid:
+            continue
+        channel = guild.get_channel(cid)
+        if channel is None:
+            try:
+                channel = await guild.fetch_channel(cid)
+            except discord.HTTPException:
+                channel = None
+        if isinstance(channel, discord.TextChannel):
+            return channel
+    return None
 
 
 async def generate_transcript(channel: discord.TextChannel, appeal: dict) -> discord.File:

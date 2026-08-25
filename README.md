@@ -111,3 +111,18 @@ schema in place is safe.
    member runs `/force_end_voting <id>` to close early. Both paths go through
    the same `finalise_appeal()` function, so the outcome is identical.
 7. Staff action the verdict; the ticket channel is transcribed and deleted.
+
+---
+
+## `/setup` — channels and roles
+
+Run once per server (Administrator):
+
+- `dashboard_channel` — text channel where `/createdashboard` posts the public "Submit a Ban Appeal" panel.
+- `ticket_category` — Discord category where new private ticket channels are created. **Required.**
+- `voting_channel` — where the ban team votes.
+- `results_channel` — where the verdict embed lands. Also the fallback destination for transcripts.
+- `ban_team_role` — role pinged on new appeals and used as the default staff role.
+- `transcripts_channel` — optional. If set, ticket transcripts on close land here instead of `results_channel`.
+
+Existing servers upgrading from an earlier version **must re-run `/setup`** to specify `ticket_category`. Until they do, appeal submissions will ephemerally refuse with an actionable message rather than creating tickets in the wrong place.

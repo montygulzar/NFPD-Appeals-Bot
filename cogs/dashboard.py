@@ -11,37 +11,56 @@ class DashboardCog(commands.Cog):
 
     @app_commands.command(name="setup", description="Configure the appeals bot for this server.")
     @app_commands.describe(
-        appeals_channel="Channel where private ticket threads are created",
+        dashboard_channel="Channel where /createdashboard posts the public appeal panel",
+        ticket_category="Category where new appeal ticket channels are created",
         voting_channel="Channel where the ban team votes on appeals",
         results_channel="Channel where verdict results are posted",
         ban_team_role="Role to ping when a new appeal is forwarded for voting",
+        transcripts_channel="Optional. Channel where transcripts are posted on ticket close. Falls back to results channel if omitted.",
     )
     @app_commands.default_permissions(administrator=True)
     async def setup(
         self,
         interaction: discord.Interaction,
-        appeals_channel: discord.TextChannel,
+        dashboard_channel: discord.TextChannel,
+        ticket_category: discord.CategoryChannel,
         voting_channel: discord.TextChannel,
         results_channel: discord.TextChannel,
         ban_team_role: discord.Role,
+        transcripts_channel: discord.TextChannel | None = None,
     ):
         await interaction.response.defer(ephemeral=True)
+
+        # dashboard_channel is stored in the legacy appeals_channel column
+        # so no destructive DB migration is needed. The user-facing name is
+        # what matters.
         await self.bot.db.upsert_guild_config(
             interaction.guild_id,
-            appeals_channel=appeals_channel.id,
+            appeals_channel=dashboard_channel.id,
+            ticket_category=ticket_category.id,
             voting_channel=voting_channel.id,
             results_channel=results_channel.id,
             ban_team_role=ban_team_role.id,
+            transcripts_channel=(transcripts_channel.id if transcripts_channel else None),
         )
 
         embed = discord.Embed(
             title="Configuration Saved",
-            description="The appeals bot is ready to use. Run `/createdashboard` in your public appeals channel to post the submission panel.",
+            description="The appeals bot is ready to use. Run `/createdashboard` in your dashboard channel to post the submission panel.",
             color=COLOUR_PRIMARY,
         )
-        embed.add_field(name="Appeals Channel", value=appeals_channel.mention, inline=True)
+        embed.add_field(name="Dashboard Channel", value=dashboard_channel.mention, inline=True)
+        embed.add_field(name="Ticket Category", value=ticket_category.mention, inline=True)
         embed.add_field(name="Voting Channel", value=voting_channel.mention, inline=True)
         embed.add_field(name="Results Channel", value=results_channel.mention, inline=True)
+        embed.add_field(
+            name="Transcripts Channel",
+            value=(
+                transcripts_channel.mention if transcripts_channel
+                else f"(falls back to {results_channel.mention})"
+            ),
+            inline=True,
+        )
         embed.add_field(name="Ban Team Role", value=ban_team_role.mention, inline=True)
         embed.set_footer(text="North Florida Police Department  |  Ban Appeals System")
         embed.timestamp = discord.utils.utcnow()

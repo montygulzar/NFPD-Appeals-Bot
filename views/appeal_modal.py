@@ -72,6 +72,21 @@ class AppealModal(discord.ui.Modal, title="NFPD Ban Appeal"):
             )
             return
 
+        # ticket_category is required as of the split-setup change.
+        # Refuse rather than fall back so tickets never land in the wrong
+        # place - staff must re-run /setup after the upgrade.
+        ticket_category_id = config["ticket_category"]
+        ticket_category = (
+            interaction.guild.get_channel(ticket_category_id) if ticket_category_id else None
+        )
+        if not isinstance(ticket_category, discord.CategoryChannel):
+            await interaction.followup.send(
+                "This server has not been fully set up. Please ask an administrator "
+                "to re-run `/setup` and specify a `ticket_category`.",
+                ephemeral=True,
+            )
+            return
+
         platform = self.platform.value.strip()
         roblox_username = self.roblox_username.value.strip()
         discord_tag = self.discord_tag.value.strip()
@@ -87,14 +102,6 @@ class AppealModal(discord.ui.Modal, title="NFPD Ban Appeal"):
             appeal_reason=appeal_reason,
             platform=platform,
         )
-
-        appeals_channel = interaction.guild.get_channel(config["appeals_channel"])
-        if not appeals_channel:
-            await interaction.followup.send(
-                "Could not find the appeals channel. Please contact an administrator.",
-                ephemeral=True,
-            )
-            return
 
         overwrites = {
             interaction.guild.default_role: discord.PermissionOverwrite(view_channel=False),
@@ -115,7 +122,7 @@ class AppealModal(discord.ui.Modal, title="NFPD Ban Appeal"):
 
         ticket_channel = await interaction.guild.create_text_channel(
             name=f"appeal-{interaction.user.name}",
-            category=appeals_channel.category,
+            category=ticket_category,
             topic=f"Ban appeal submitted by {interaction.user} | Appeal ID: {appeal_id}",
             overwrites=overwrites,
         )

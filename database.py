@@ -112,6 +112,20 @@ class Database:
                     dashboard_msg_id BIGINT
                 )
             """)
+            # ticket_category: category ID where new appeal ticket channels
+            # are created. Split from appeals_channel (which stays as the
+            # public dashboard channel) so staff can control ticket placement
+            # explicitly instead of relying on appeals_channel.category.
+            await conn.execute(
+                "ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS ticket_category BIGINT"
+            )
+            # transcripts_channel: where ticket transcripts are posted on
+            # close. Nullable - NULL means "fall back to results_channel"
+            # so existing servers keep working without an immediate
+            # re-/setup after this deploy.
+            await conn.execute(
+                "ALTER TABLE guild_config ADD COLUMN IF NOT EXISTS transcripts_channel BIGINT"
+            )
 
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS appeals (

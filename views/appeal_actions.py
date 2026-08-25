@@ -127,20 +127,20 @@ class AppealActionsView(discord.ui.View):
                 await db.close_appeal(appeal_id, "closed")
 
                 config = await db.get_guild_config(interaction.guild_id)
-                if config and config.get("results_channel"):
-                    results_channel = interaction.guild.get_channel(config["results_channel"])
-                    if results_channel is None:
-                        try:
-                            results_channel = await interaction.guild.fetch_channel(config["results_channel"])
-                        except discord.HTTPException:
-                            _logger.warning("Could not find results channel %s", config["results_channel"])
-                    if results_channel:
-                        try:
-                            transcript_file = await generate_transcript(interaction.channel, appeal)
-                            embed = build_transcript_embed(appeal, interaction.user, "Closed by staff")
-                            await results_channel.send(embed=embed, file=transcript_file)
-                        except Exception:
-                            _logger.exception("Failed to post transcript for appeal %s", appeal_id)
+                from views.transcript import resolve_transcripts_channel
+                target = await resolve_transcripts_channel(interaction.guild, config)
+                if target is None:
+                    _logger.warning(
+                        "No transcripts destination for appeal %s (neither transcripts_channel "
+                        "nor results_channel resolves).", appeal_id,
+                    )
+                else:
+                    try:
+                        transcript_file = await generate_transcript(interaction.channel, appeal)
+                        embed = build_transcript_embed(appeal, interaction.user, "Closed by staff")
+                        await target.send(embed=embed, file=transcript_file)
+                    except Exception:
+                        _logger.exception("Failed to post transcript for appeal %s", appeal_id)
 
         await interaction.followup.send("Closing ticket in 5 seconds...", ephemeral=True)
         await asyncio.sleep(5)
