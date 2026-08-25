@@ -1,0 +1,47 @@
+# NFPD Appeals Bot - self-hosted deployment.
+#
+# PostgreSQL is NOT defined here. It is expected to already be running as the
+# `appeals-postgres` container on the shared `nodey-monitoring` network. This
+# compose file defines only the bot service.
+
+services:
+  nfpd-appeals-bot:
+    build: .
+    image: nfpd-appeals-bot:latest
+    container_name: nfpd-appeals-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    networks:
+      - nodey-monitoring
+    # tini in the image already gives us proper PID 1 - do NOT enable
+    # `init: true` here or we would end up with two init processes.
+    stop_grace_period: 30s
+    read_only: false
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: ${BOT_MEM_LIMIT:-256m}
+    memswap_limit: ${BOT_MEM_LIMIT:-256m}
+    pids_limit: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    healthcheck:
+      # Cheap process liveness check: if the interpreter can import the
+      # config module the process is at least up. Discord/Postgres readiness
+      # is logged rather than exposed here because Docker HEALTHCHECK failures
+      # do NOT restart the container by themselves - `restart: unless-stopped`
+      # handles crash recovery.
+      test: ["CMD", "python", "-c", "import config"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+networks:
+  nodey-monitoring:
+    external: true

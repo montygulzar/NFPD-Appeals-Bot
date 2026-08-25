@@ -1,5 +1,8 @@
+import asyncio
 import logging
+import logging.handlers
 import os
+import signal
 
 import discord
 import config as _config
@@ -11,19 +14,36 @@ from config import (
     DEVELOPER_IDS,
     DISCORD_TOKEN,
     LEAVE_UNAPPROVED_GUILDS,
+    LOG_LEVEL,
     UNAUTHORISED_GUILD_MESSAGE,
+    DB_CONNECT_MAX_WAIT,
+    DB_POOL_MIN,
+    DB_POOL_MAX,
 )
 from database import Database
 from cogs.appeals import AppealsCog
 from cogs.dashboard import DashboardCog
 from cogs.debug import DebugCog
 from cogs.voting import VotingCog
+from cogs.staff import StaffCog
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-)
-logger = logging.getLogger("appeals-bot")
+
+def _setup_logging() -> logging.Logger:
+    level = getattr(logging, LOG_LEVEL, logging.INFO)
+    handler = logging.StreamHandler()
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    )
+    root = logging.getLogger()
+    root.setLevel(level)
+    # Replace any pre-existing handlers so Docker gets exactly one stdout stream.
+    root.handlers = [handler]
+    logging.getLogger("discord").setLevel(logging.WARNING)
+    logging.getLogger("discord.http").setLevel(logging.WARNING)
+    return logging.getLogger("appeals-bot")
+
+
+logger = _setup_logging()
 
 
 class AppealsBot(commands.Bot):
@@ -32,26 +52,24 @@ class AppealsBot(commands.Bot):
         intents.members = True
         super().__init__(command_prefix="!", intents=intents)
         self.db: Database = None
+        self._persistent_views_added = False
 
     async def setup_hook(self):
-        # Wrap database setup so a connection failure gives a readable error
-        # rather than a traceback that looks like the bot crashed for no reason.
+        # DB startup - retries transient connection failures so a slow-starting
+        # appeals-postgres container does not turn into an immediate crash loop.
+        self.db = Database(DATABASE_URL, min_size=DB_POOL_MIN, max_size=DB_POOL_MAX)
         try:
-            self.db = Database(DATABASE_URL)
-            await self.db.initialise()
+            await self.db.initialise(connect_max_wait_seconds=DB_CONNECT_MAX_WAIT)
             logger.info("Database connected.")
         except Exception as exc:
-            logger.error(
-                "Database connection failed: %s\n"
-                "Check DATABASE_URL in Railway's Variables tab. "
-                "Make sure a PostgreSQL plugin is attached to this service.",
-                exc,
-            )
+            # Log the type and message but never the raw DSN.
+            logger.error("Database initialisation failed: %s", exc)
             raise
 
         await self.add_cog(DashboardCog(self))
         await self.add_cog(AppealsCog(self))
         await self.add_cog(VotingCog(self))
+        await self.add_cog(StaffCog(self))
         await self.add_cog(DebugCog(self))
 
         try:
@@ -60,35 +78,44 @@ class AppealsBot(commands.Bot):
         except Exception as exc:
             logger.error("Slash command sync failed: %s", exc)
 
+    async def close(self):
+        """Graceful shutdown: close Discord first, then release the DB pool."""
+        try:
+            await super().close()
+        finally:
+            if self.db is not None:
+                try:
+                    await self.db.close()
+                    logger.info("Database pool closed cleanly.")
+                except Exception:
+                    logger.exception("Error closing database pool.")
+
     async def on_ready(self):
         logger.info("Logged in as %s (%s)", self.user, self.user.id)
         _config.BOT_AVATAR_URL = self.user.display_avatar.url
         logger.info("In %d guild(s).", len(self.guilds))
 
-        # Warn loudly if the allowlist is empty - this is the #1 reason the bot
-        # appears offline (it joins then immediately leaves every server).
         if not APPROVED_GUILD_IDS:
             logger.error(
-                "\n"
-                "  *** APPROVED_GUILD_IDS IS EMPTY - BOT WILL LEAVE EVERY SERVER ***\n"
-                "  Go to Railway -> your service -> Variables and add:\n"
-                "  APPROVED_GUILD_IDS=<your server ID>\n"
-                "  Right-click your server icon in Discord -> Copy Server ID\n"
+                "APPROVED_GUILD_IDS is empty - bot will leave every server it joins. "
+                "Set APPROVED_GUILD_IDS in .env to a comma-separated list of guild IDs."
             )
 
-        # Register persistent views so buttons on old messages survive restarts.
-        from views.appeal_panel import AppealPanelView
-        from views.voting_panel import VotingPanelView
-        from views.verdict_panel import VerdictPanelView
-        from views.appeal_actions import AppealActionsView
+        # on_ready fires on every Discord reconnect. Persistent views must be
+        # registered exactly once for the process lifetime, otherwise duplicate
+        # handlers accumulate and vote buttons fire N times per click.
+        if not self._persistent_views_added:
+            from views.appeal_panel import AppealPanelView
+            from views.voting_panel import VotingPanelView
+            from views.verdict_panel import VerdictPanelView
+            from views.appeal_actions import AppealActionsView
 
-        self.add_view(AppealPanelView(self))
-        self.add_view(VotingPanelView(self))
-        self.add_view(VerdictPanelView(self))
-        self.add_view(AppealActionsView(self))
+            self.add_view(AppealPanelView(self))
+            self.add_view(VotingPanelView(self))
+            self.add_view(VerdictPanelView(self))
+            self.add_view(AppealActionsView(self))
+            self._persistent_views_added = True
 
-        # Audit current guilds. If the bot was added to an unapproved server
-        # while offline, handle it now rather than silently sitting there.
         for guild in self.guilds:
             if _is_approved(guild):
                 logger.info("Approved guild: %s (%s)", guild.name, guild.id)
@@ -111,7 +138,6 @@ class AppealsBot(commands.Bot):
 # ---------------------------------------------------------------------------
 
 def _is_approved(guild: discord.Guild) -> bool:
-    # An empty allowlist means nothing is approved - bot leaves everything.
     return bool(APPROVED_GUILD_IDS) and guild.id in APPROVED_GUILD_IDS
 
 
@@ -125,7 +151,6 @@ async def _alert_developers(bot: AppealsBot, message: str) -> None:
 
 
 async def _handle_unapproved_guild(bot: AppealsBot, guild: discord.Guild) -> None:
-    """DM developers with full details then optionally leave."""
     inviter_name, inviter_id = "Unknown", "Unknown"
     try:
         async for entry in guild.audit_logs(limit=5, action=discord.AuditLogAction.bot_add):
@@ -189,9 +214,36 @@ async def _handle_unapproved_guild(bot: AppealsBot, guild: discord.Guild) -> Non
             logger.warning("Could not leave %s (%s): %s", guild.name, guild.id, exc)
 
 
-def main():
+async def _run() -> None:
+    """Runs the bot with graceful SIGTERM/SIGINT handling for Docker.
+
+    docker stop sends SIGTERM. We translate it into a bot.close() call so the
+    asyncpg pool and Discord gateway shut down cleanly instead of being torn
+    down mid-write when the 10s grace expires.
+    """
     bot = AppealsBot()
-    bot.run(DISCORD_TOKEN, log_handler=None)
+    loop = asyncio.get_running_loop()
+
+    def _handle_shutdown_signal(signame: str) -> None:
+        logger.info("Received %s - shutting down gracefully.", signame)
+        loop.create_task(bot.close())
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop.add_signal_handler(sig, _handle_shutdown_signal, sig.name)
+        except NotImplementedError:
+            # Windows / restricted environments.
+            pass
+
+    async with bot:
+        await bot.start(DISCORD_TOKEN)
+
+
+def main():
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
 
 
 if __name__ == "__main__":

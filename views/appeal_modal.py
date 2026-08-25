@@ -1,6 +1,6 @@
 import discord
 
-from config import BOT_AVATAR_URL, COLOUR_INFO, COLOUR_PRIMARY
+from config import APPEAL_COOLDOWN_HOURS, BOT_AVATAR_URL, COLOUR_INFO, COLOUR_PRIMARY
 
 
 class AppealModal(discord.ui.Modal, title="NFPD Ban Appeal"):
@@ -46,13 +46,23 @@ class AppealModal(discord.ui.Modal, title="NFPD Ban Appeal"):
         guild_id = interaction.guild_id
         user_id = interaction.user.id
 
-        existing = await db.get_open_appeal_for_user(guild_id, user_id)
+        existing = await db.get_active_appeal_for_user(guild_id, user_id)
         if existing:
             await interaction.followup.send(
                 "You already have an open appeal. Please wait for it to be resolved before submitting another.",
                 ephemeral=True,
             )
             return
+
+        if APPEAL_COOLDOWN_HOURS > 0:
+            cooldown = await db.get_active_cooldown(guild_id, user_id)
+            if cooldown:
+                await interaction.followup.send(
+                    "You are currently on an appeal cooldown. You may submit a new "
+                    f"appeal <t:{int(cooldown['expires_at'].timestamp())}:R>.",
+                    ephemeral=True,
+                )
+                return
 
         config = await db.get_guild_config(guild_id)
         if not config or not config["appeals_channel"]:

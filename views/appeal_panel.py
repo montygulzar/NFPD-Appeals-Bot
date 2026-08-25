@@ -15,7 +15,7 @@ class AppealPanelView(discord.ui.View):
         custom_id="appeals:open_modal",
     )
     async def open_appeal(self, interaction: discord.Interaction, button: discord.ui.Button):
-        existing = await self.bot.db.get_open_appeal_for_user(interaction.guild_id, interaction.user.id)
+        existing = await self.bot.db.get_active_appeal_for_user(interaction.guild_id, interaction.user.id)
         if existing:
             await interaction.response.send_message(
                 "You already have an open appeal. Please wait for it to be resolved before submitting another.",

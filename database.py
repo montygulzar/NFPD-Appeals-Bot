@@ -1,18 +1,100 @@
+import asyncio
+import logging
+from datetime import datetime, timezone, timedelta
+from typing import Optional
+
 import asyncpg
+
+logger = logging.getLogger("appeals-bot.db")
+
+
+# Terminal statuses - an appeal in one of these has been fully resolved.
+TERMINAL_STATUSES = frozenset({
+    "accepted", "rejected", "closed", "actioned_unban", "actioned_close",
+})
 
 
 class Database:
-    """Thin wrapper around an asyncpg connection pool."""
+    """Thin wrapper around an asyncpg connection pool.
 
-    def __init__(self, dsn: str):
+    Handles startup retry for a still-booting PostgreSQL container and exposes
+    atomic finalisation primitives so nothing can double-resolve an appeal.
+    """
+
+    def __init__(self, dsn: str, *, min_size: int = 1, max_size: int = 5):
         self._dsn = dsn
-        self._pool: asyncpg.Pool = None
+        self._min_size = min_size
+        self._max_size = max_size
+        self._pool: Optional[asyncpg.Pool] = None
 
-    async def initialise(self):
-        self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
+    # ------------------------------------------------------------------ #
+    # Lifecycle                                                          #
+    # ------------------------------------------------------------------ #
+
+    async def initialise(self, *, connect_max_wait_seconds: int = 120):
+        """Create the pool, retrying transient network errors.
+
+        Distinguishes recoverable connection errors (server not up yet) from
+        fatal authentication/configuration errors (bad password, wrong DB) so
+        the container does not crash-loop on misconfiguration.
+        """
+        deadline = asyncio.get_event_loop().time() + connect_max_wait_seconds
+        delay = 1.0
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                self._pool = await asyncpg.create_pool(
+                    self._dsn,
+                    min_size=self._min_size,
+                    max_size=self._max_size,
+                    command_timeout=30,
+                )
+                # Verify the pool actually works.
+                async with self._pool.acquire() as conn:
+                    await conn.fetchval("SELECT 1")
+                break
+            except (asyncpg.InvalidPasswordError,
+                    asyncpg.InvalidAuthorizationSpecificationError,
+                    asyncpg.InvalidCatalogNameError) as exc:
+                # Non-recoverable: config is wrong. Do NOT retry forever.
+                raise RuntimeError(
+                    f"Fatal PostgreSQL configuration error: {type(exc).__name__}. "
+                    "Check DATABASE_URL credentials and database name."
+                ) from exc
+            except (OSError, asyncpg.CannotConnectNowError,
+                    asyncpg.PostgresConnectionError) as exc:
+                if asyncio.get_event_loop().time() >= deadline:
+                    raise RuntimeError(
+                        f"PostgreSQL not reachable after {connect_max_wait_seconds}s: {exc}"
+                    ) from exc
+                logger.warning(
+                    "PostgreSQL not ready (attempt %d): %s. Retrying in %.1fs",
+                    attempt, exc, delay,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 15.0)
         await self._create_tables()
 
+    async def close(self):
+        if self._pool is not None:
+            await self._pool.close()
+            self._pool = None
+
+    async def ping(self) -> bool:
+        try:
+            async with self._pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            return True
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------ #
+    # Schema                                                             #
+    # ------------------------------------------------------------------ #
+
     async def _create_tables(self):
+        # All statements are idempotent - safe against the live production DB.
         async with self._pool.acquire() as conn:
             await conn.execute("""
                 CREATE TABLE IF NOT EXISTS guild_config (
@@ -42,18 +124,29 @@ class Database:
                 )
             """)
 
-            # Add platform column if it doesn't exist yet (migration for existing deployments).
+            # Additive migrations - safe to run on the existing production DB.
             await conn.execute(
                 "ALTER TABLE appeals ADD COLUMN IF NOT EXISTS platform TEXT NOT NULL DEFAULT 'Unknown'"
             )
+            await conn.execute(
+                "ALTER TABLE appeals ADD COLUMN IF NOT EXISTS finalised_at TIMESTAMPTZ"
+            )
+            await conn.execute(
+                "ALTER TABLE appeals ADD COLUMN IF NOT EXISTS finalised_by BIGINT"
+            )
 
-            # Partial unique index: one open appeal per user per guild.
-            # Unlike UNIQUE(guild_id, appellant_id, status), this only fires when status='open',
-            # so closed/rejected/accepted appeals can accumulate freely.
+            # Partial unique index: at most one *active* appeal (open or voting)
+            # per user per guild. Blocks the modal-side double-submit race and
+            # cleanly permits historical rows in closed states.
+            #
+            # An older deployment had this restricted to status='open' only;
+            # migrate by dropping it if present, then recreating with the wider
+            # predicate. Both operations are idempotent.
+            await conn.execute("DROP INDEX IF EXISTS appeals_one_open_per_user")
             await conn.execute("""
-                CREATE UNIQUE INDEX IF NOT EXISTS appeals_one_open_per_user
+                CREATE UNIQUE INDEX IF NOT EXISTS appeals_one_active_per_user
                 ON appeals (guild_id, appellant_id)
-                WHERE status = 'open'
+                WHERE status IN ('open', 'voting')
             """)
 
             await conn.execute("""
@@ -66,11 +159,29 @@ class Database:
                 )
             """)
 
+            # New: cooldowns. Additive; default deployment has cooldown hours=0
+            # so no rows are ever inserted and behaviour is unchanged.
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS appeal_cooldowns (
+                    guild_id    BIGINT NOT NULL,
+                    user_id     BIGINT NOT NULL,
+                    expires_at  TIMESTAMPTZ NOT NULL,
+                    reason      TEXT,
+                    created_at  TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    PRIMARY KEY (guild_id, user_id)
+                )
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS appeals_history_lookup
+                ON appeals (guild_id, appellant_id, id DESC)
+            """)
+
     # ------------------------------------------------------------------ #
-    # Guild config                                                         #
+    # Guild config                                                       #
     # ------------------------------------------------------------------ #
 
-    async def get_guild_config(self, guild_id: int) -> asyncpg.Record | None:
+    async def get_guild_config(self, guild_id: int) -> Optional[asyncpg.Record]:
         async with self._pool.acquire() as conn:
             return await conn.fetchrow(
                 "SELECT * FROM guild_config WHERE guild_id = $1", guild_id
@@ -96,16 +207,23 @@ class Database:
             )
 
     # ------------------------------------------------------------------ #
-    # Appeals                                                              #
+    # Appeals                                                            #
     # ------------------------------------------------------------------ #
 
-    async def get_open_appeal_for_user(self, guild_id: int, user_id: int) -> asyncpg.Record | None:
+    async def get_active_appeal_for_user(self, guild_id: int, user_id: int) -> Optional[asyncpg.Record]:
+        """Returns an appeal in 'open' or 'voting' status, if any."""
         async with self._pool.acquire() as conn:
             return await conn.fetchrow(
-                "SELECT * FROM appeals WHERE guild_id = $1 AND appellant_id = $2 AND status = 'open'",
+                "SELECT * FROM appeals "
+                "WHERE guild_id = $1 AND appellant_id = $2 "
+                "  AND status IN ('open', 'voting')",
                 guild_id,
                 user_id,
             )
+
+    # Kept for backwards compatibility with any external caller.
+    async def get_open_appeal_for_user(self, guild_id: int, user_id: int):
+        return await self.get_active_appeal_for_user(guild_id, user_id)
 
     async def create_appeal(
         self,
@@ -121,21 +239,17 @@ class Database:
             row = await conn.fetchrow(
                 """
                 INSERT INTO appeals
-                    (guild_id, appellant_id, roblox_username, discord_tag, ban_reason, appeal_reason, platform)
+                    (guild_id, appellant_id, roblox_username, discord_tag,
+                     ban_reason, appeal_reason, platform)
                 VALUES ($1, $2, $3, $4, $5, $6, $7)
                 RETURNING id
                 """,
-                guild_id,
-                appellant_id,
-                roblox_username,
-                discord_tag,
-                ban_reason,
-                appeal_reason,
-                platform,
+                guild_id, appellant_id, roblox_username, discord_tag,
+                ban_reason, appeal_reason, platform,
             )
             return row["id"]
 
-    async def get_appeal(self, appeal_id: int) -> asyncpg.Record | None:
+    async def get_appeal(self, appeal_id: int) -> Optional[asyncpg.Record]:
         async with self._pool.acquire() as conn:
             return await conn.fetchrow(
                 "SELECT * FROM appeals WHERE id = $1", appeal_id
@@ -145,52 +259,113 @@ class Database:
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "UPDATE appeals SET ticket_channel = $1 WHERE id = $2",
-                channel_id,
-                appeal_id,
+                channel_id, appeal_id,
             )
 
-    async def set_appeal_voting(self, appeal_id: int, voting_msg_id: int, closes_at):
+    async def claim_open_for_voting(self, appeal_id: int, voting_msg_id: int, closes_at) -> bool:
+        """Atomically move an appeal from 'open' to 'voting'.
+
+        Returns True if this call was the one that made the transition; False
+        if another concurrent forward already claimed it.
+        """
         async with self._pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE appeals SET voting_msg_id = $1, closes_at = $2, status = 'voting' WHERE id = $3",
-                voting_msg_id,
-                closes_at,
-                appeal_id,
+            row = await conn.fetchrow(
+                "UPDATE appeals "
+                "SET voting_msg_id = $1, closes_at = $2, status = 'voting' "
+                "WHERE id = $3 AND status = 'open' "
+                "RETURNING id",
+                voting_msg_id, closes_at, appeal_id,
             )
+            return row is not None
+
+    # Kept for backwards compatibility with any external caller.
+    async def set_appeal_voting(self, appeal_id: int, voting_msg_id: int, closes_at):
+        await self.claim_open_for_voting(appeal_id, voting_msg_id, closes_at)
+
+    async def claim_for_finalisation(self, appeal_id: int, actor_id: Optional[int] = None) -> bool:
+        """Atomically mark a 'voting' appeal as being finalised right now.
+
+        Uses a conditional UPDATE so exactly one of many concurrent finalisers
+        (the scheduled task, /force_end_voting) wins. The winning call proceeds
+        to compute and post the verdict; losers get False and back off.
+
+        The status is set to 'finalising' (a short-lived transitional state)
+        and the caller is expected to call close_appeal() with the terminal
+        status once the verdict computation is done.
+        """
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "UPDATE appeals "
+                "SET status = 'finalising', finalised_at = NOW(), "
+                "    finalised_by = COALESCE($2, finalised_by) "
+                "WHERE id = $1 AND status = 'voting' "
+                "RETURNING id",
+                appeal_id, actor_id,
+            )
+            return row is not None
 
     async def close_appeal(self, appeal_id: int, status: str):
         """
         Valid statuses:
-          'accepted'       - vote result: unban won (awaiting staff action)
-          'rejected'       - vote result: keep banned won (awaiting staff action)
-          'closed'         - inconclusive vote, or staff manually closed before voting
+          'accepted'       - vote result: unban won
+          'rejected'       - vote result: keep banned won
+          'closed'         - inconclusive vote, or staff closed before voting
           'actioned_unban' - staff pressed Execute Unban
           'actioned_close' - staff pressed Close Ticket after verdict
         """
         async with self._pool.acquire() as conn:
             await conn.execute(
                 "UPDATE appeals SET status = $1 WHERE id = $2",
-                status,
-                appeal_id,
+                status, appeal_id,
             )
 
     async def get_appeals_due_for_verdict(self):
-        """Returns all appeals in 'voting' status whose closes_at has passed."""
         async with self._pool.acquire() as conn:
             return await conn.fetch(
                 "SELECT * FROM appeals WHERE status = 'voting' AND closes_at <= NOW()"
             )
 
+    async def get_recent_appeals(self, guild_id: int, limit: int = 5):
+        async with self._pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT id, status, roblox_username, appellant_id, created_at "
+                "FROM appeals WHERE guild_id = $1 ORDER BY id DESC LIMIT $2",
+                guild_id, limit,
+            )
+
+    async def get_user_appeals(self, guild_id: int, user_id: int, *, limit: int = 10):
+        async with self._pool.acquire() as conn:
+            return await conn.fetch(
+                "SELECT id, status, roblox_username, ban_reason, appeal_reason, "
+                "       platform, created_at "
+                "FROM appeals "
+                "WHERE guild_id = $1 AND appellant_id = $2 "
+                "ORDER BY id DESC LIMIT $3",
+                guild_id, user_id, limit,
+            )
+
+    async def get_user_appeal_stats(self, guild_id: int, user_id: int) -> dict:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT status, COUNT(*) AS n FROM appeals "
+                "WHERE guild_id = $1 AND appellant_id = $2 GROUP BY status",
+                guild_id, user_id,
+            )
+        stats = {"total": 0}
+        for row in rows:
+            stats[row["status"]] = row["n"]
+            stats["total"] += row["n"]
+        return stats
+
     # ------------------------------------------------------------------ #
-    # Votes                                                                #
+    # Votes                                                              #
     # ------------------------------------------------------------------ #
 
-    async def get_vote(self, appeal_id: int, voter_id: int) -> asyncpg.Record | None:
+    async def get_vote(self, appeal_id: int, voter_id: int) -> Optional[asyncpg.Record]:
         async with self._pool.acquire() as conn:
             return await conn.fetchrow(
                 "SELECT * FROM votes WHERE appeal_id = $1 AND voter_id = $2",
-                appeal_id,
-                voter_id,
+                appeal_id, voter_id,
             )
 
     async def upsert_vote(self, appeal_id: int, voter_id: int, vote: str):
@@ -201,18 +376,7 @@ class Database:
                 VALUES ($1, $2, $3)
                 ON CONFLICT (appeal_id, voter_id) DO UPDATE SET vote = EXCLUDED.vote
                 """,
-                appeal_id,
-                voter_id,
-                vote,
-            )
-
-    async def get_recent_appeals(self, guild_id: int, limit: int = 5) -> list:
-        async with self._pool.acquire() as conn:
-            return await conn.fetch(
-                "SELECT id, status, roblox_username, appellant_id, created_at "
-                "FROM appeals WHERE guild_id = $1 ORDER BY id DESC LIMIT $2",
-                guild_id,
-                limit,
+                appeal_id, voter_id, vote,
             )
 
     async def get_vote_tally(self, appeal_id: int) -> dict:
@@ -225,3 +389,43 @@ class Database:
         for row in rows:
             tally[row["vote"]] = row["count"]
         return tally
+
+    # ------------------------------------------------------------------ #
+    # Cooldowns                                                          #
+    # ------------------------------------------------------------------ #
+
+    async def get_active_cooldown(self, guild_id: int, user_id: int) -> Optional[asyncpg.Record]:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchrow(
+                "SELECT * FROM appeal_cooldowns "
+                "WHERE guild_id = $1 AND user_id = $2 AND expires_at > NOW()",
+                guild_id, user_id,
+            )
+
+    async def set_cooldown(self, guild_id: int, user_id: int, hours: int, reason: str = ""):
+        if hours <= 0:
+            return
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=hours)
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                """
+                INSERT INTO appeal_cooldowns (guild_id, user_id, expires_at, reason)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (guild_id, user_id)
+                DO UPDATE SET expires_at = EXCLUDED.expires_at, reason = EXCLUDED.reason
+                """,
+                guild_id, user_id, expires_at, reason,
+            )
+
+    async def remove_cooldown(self, guild_id: int, user_id: int) -> bool:
+        """Delete any active cooldown for the user. Returns True if one was
+        actually removed (the user had an active cooldown), False if there was
+        nothing to remove."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "DELETE FROM appeal_cooldowns "
+                "WHERE guild_id = $1 AND user_id = $2 AND expires_at > NOW() "
+                "RETURNING user_id",
+                guild_id, user_id,
+            )
+            return row is not None

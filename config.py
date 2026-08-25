@@ -1,29 +1,46 @@
 """
 Runtime configuration loaded entirely from environment variables.
 
-Set these in Railway's Variables tab - no code changes needed to approve servers,
-add developers, or change vote thresholds.
+All values come from the container's environment (populated from .env in the
+self-hosted docker-compose setup). No code changes needed to change vote
+thresholds, add developers, or approve servers.
 
-  DISCORD_TOKEN          Your bot token (required)
-  DATABASE_URL           Injected automatically by Railway's PostgreSQL plugin (required)
+  DISCORD_TOKEN            Bot token (required).
+  DATABASE_URL             PostgreSQL DSN (required). In the self-hosted
+                           deployment this points at the existing
+                           appeals-postgres container on the nodey-monitoring
+                           network, e.g.
+                           postgresql://appeals:PASSWORD@appeals-postgres:5432/appeals
 
-  APPROVED_GUILD_IDS     Comma-separated guild IDs the bot is allowed to stay in.
-                         Leave empty and the bot leaves every server it joins.
-                         Example: 123456789012345678,987654321098765432
+  APPROVED_GUILD_IDS       Comma-separated guild IDs the bot is allowed to
+                           stay in. Empty = leaves every server it joins.
 
-  LEAVE_UNAPPROVED_GUILDS  Set to true to auto-leave unapproved servers (default: true).
-                           Set to false to stay but still alert developers.
+  LEAVE_UNAPPROVED_GUILDS  true/false. Default true.
 
-  DEVELOPER_IDS          Comma-separated Discord user IDs to DM when an unapproved
-                         server join is detected. Default: 1285998518213017663 (omb).
+  DEVELOPER_IDS            Comma-separated Discord user IDs to DM on
+                           unapproved-guild joins. Default: 1285998518213017663.
 
-  MINIMUM_VOTES          Votes needed for a valid appeal result (default: 3).
+  STAFF_ROLE_IDS           Comma-separated role IDs that count as Appeals
+                           staff for /force_end_voting, /user_appeal_history,
+                           and /remove_cooldown. Empty = fall back to the
+                           per-guild ban_team_role configured via /setup, and
+                           finally to Discord's manage_guild permission.
 
-  VOTING_HOURS           How many hours the voting window stays open (default: 48).
+  MINIMUM_VOTES            Votes needed for a valid result (default 3).
+  VOTING_HOURS             Voting window length in hours (default 48).
+  BAN_TEAM_ROLE_IDS        Extra role IDs allowed to vote.
 
-  BAN_TEAM_ROLE_IDS      Comma-separated role IDs whose members are allowed to vote.
-                         If empty, anyone in the voting channel can vote.
-                         These supplement (not replace) the ban_team_role set via /setup.
+  APPEAL_COOLDOWN_HOURS    Hours a user must wait between appeals after their
+                           previous appeal is finalised. Default 0 (disabled)
+                           - preserves the existing production behaviour of
+                           blocking only while an appeal is currently active.
+
+  DB_CONNECT_MAX_WAIT      Seconds the bot will wait at startup for PostgreSQL
+                           to become reachable before giving up. Default 120.
+  DB_POOL_MIN              asyncpg pool min_size. Default 1.
+  DB_POOL_MAX              asyncpg pool max_size. Default 5.
+
+  LOG_LEVEL                DEBUG/INFO/WARNING/ERROR. Default INFO.
 """
 import os
 import sys
@@ -48,7 +65,7 @@ def _parse_bool(name: str, *, default: bool = True) -> bool:
     raw = os.environ.get(name, "").strip().lower()
     if not raw:
         return default
-    return raw in {"1", "true", "yes"}
+    return raw in {"1", "true", "yes", "on"}
 
 
 def _parse_int(name: str, *, default: int) -> int:
@@ -65,26 +82,23 @@ def _parse_int(name: str, *, default: int) -> int:
 
 DISCORD_TOKEN: str = os.environ.get("DISCORD_TOKEN", "").strip()
 if not DISCORD_TOKEN:
-    _fail("DISCORD_TOKEN is required. Set it in Railway's Variables tab.")
+    _fail("DISCORD_TOKEN is required. Set it in .env.")
 
 DATABASE_URL: str = os.environ.get("DATABASE_URL", "").strip()
 if not DATABASE_URL:
     _fail(
-        "DATABASE_URL is required. "
-        "Add a PostgreSQL plugin to your Railway project and it will be injected automatically."
+        "DATABASE_URL is required. In the self-hosted deployment this should "
+        "point at the appeals-postgres container over the nodey-monitoring "
+        "network, e.g. postgresql://appeals:PASSWORD@appeals-postgres:5432/appeals"
     )
 
 # ── Guild allowlist ───────────────────────────────────────────────────────────
 
 APPROVED_GUILD_IDS: set[int] = _parse_id_list("APPROVED_GUILD_IDS")
-
-# When True (the default), the bot leaves any server not in APPROVED_GUILD_IDS.
-# Set LEAVE_UNAPPROVED_GUILDS=false in Railway to stay but still alert developers.
 LEAVE_UNAPPROVED_GUILDS: bool = _parse_bool("LEAVE_UNAPPROVED_GUILDS", default=True)
 
 # ── Developer alerts ──────────────────────────────────────────────────────────
 
-# Defaults to omb's ID. Add more IDs separated by commas.
 DEVELOPER_IDS: set[int] = _parse_id_list("DEVELOPER_IDS", default="1285998518213017663")
 
 # ── Appeal settings ───────────────────────────────────────────────────────────
@@ -92,6 +106,15 @@ DEVELOPER_IDS: set[int] = _parse_id_list("DEVELOPER_IDS", default="1285998518213
 MINIMUM_VOTES: int = _parse_int("MINIMUM_VOTES", default=3)
 VOTING_HOURS: int  = _parse_int("VOTING_HOURS", default=48)
 BAN_TEAM_ROLE_IDS: set[int] = _parse_id_list("BAN_TEAM_ROLE_IDS")
+STAFF_ROLE_IDS: set[int] = _parse_id_list("STAFF_ROLE_IDS")
+APPEAL_COOLDOWN_HOURS: int = _parse_int("APPEAL_COOLDOWN_HOURS", default=0)
+
+# ── Runtime / DB ──────────────────────────────────────────────────────────────
+
+DB_CONNECT_MAX_WAIT: int = _parse_int("DB_CONNECT_MAX_WAIT", default=120)
+DB_POOL_MIN: int = _parse_int("DB_POOL_MIN", default=1)
+DB_POOL_MAX: int = _parse_int("DB_POOL_MAX", default=5)
+LOG_LEVEL: str = (os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO").upper()
 
 # ── Brand ─────────────────────────────────────────────────────────────────────
 
@@ -111,5 +134,4 @@ UNAUTHORISED_GUILD_MESSAGE = (
 )
 
 # Bot avatar URL - set at startup in on_ready so all embed builders can reference it.
-# Do not set this manually; it is populated automatically.
 BOT_AVATAR_URL: str | None = None

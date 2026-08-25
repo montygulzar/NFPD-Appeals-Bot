@@ -24,11 +24,11 @@ class DebugCog(commands.Cog):
         # 1. Database connectivity
         try:
             start = time.perf_counter()
-            await self.bot.db._pool.fetchval("SELECT 1")
+            ok = await self.bot.db.ping()
             latency_ms = (time.perf_counter() - start) * 1000
-            results.append(f"Database: OK ({latency_ms:.0f}ms)")
+            results.append(f"Database: {'OK' if ok else 'FAIL'} ({latency_ms:.0f}ms)")
         except Exception as exc:
-            results.append(f"Database: FAIL - {exc}")
+            results.append(f"Database: FAIL - {type(exc).__name__}")
 
         # 2. Guild config
         config = await self.bot.db.get_guild_config(interaction.guild_id)

@@ -81,11 +81,26 @@ class AppealActionsView(discord.ui.View):
             view=VotingPanelView(self.bot, appeal_id),
         )
 
-        await db.set_appeal_voting(appeal_id, voting_msg.id, closes_at)
+        # Atomic claim - loses gracefully if another staff double-clicks or
+        # runs /forwardtobanteam at the same time.
+        claimed = await db.claim_open_for_voting(appeal_id, voting_msg.id, closes_at)
+        if not claimed:
+            try:
+                await voting_msg.delete()
+            except discord.HTTPException:
+                pass
+            await interaction.followup.send(
+                "This appeal was already forwarded a moment ago. No duplicate created.",
+                ephemeral=True,
+            )
+            return
 
         button.disabled = True
         button.label = "Forwarded to Ban Team ✔"
-        await interaction.message.edit(view=self)
+        try:
+            await interaction.message.edit(view=self)
+        except discord.HTTPException:
+            pass
 
         await interaction.followup.send(
             f"Forwarded to {voting_channel.mention}. Voting closes {discord.utils.format_dt(closes_at, 'R')}.",
