@@ -8,49 +8,18 @@ from discord.ext import commands
 
 from config import (
     APPEAL_COOLDOWN_HOURS,
-    BOT_AVATAR_URL,
+    bot_avatar_url,
     COLOUR_ACCEPTED,
     COLOUR_CLOSED,
     COLOUR_INFO,
     COLOUR_PRIMARY,
     COLOUR_REJECTED,
     COLOUR_VOTING,
-    STAFF_ROLE_IDS,
 )
 from cogs.voting import finalise_appeal
+from permissions import is_appeals_staff as _is_appeals_staff
 
 logger = logging.getLogger("appeals-bot.staff")
-
-
-def _is_appeals_staff(interaction: discord.Interaction, guild_config) -> bool:
-    """Truthy if the invoker counts as Appeals staff for this guild.
-
-    Order of precedence:
-      1. STAFF_ROLE_IDS env - a role in that set.
-      2. Per-guild ban_team_role configured via /setup.
-      3. Fallback: Discord manage_guild permission (same permission the
-         existing /forwardtobanteam and /appealinfo commands already
-         require - this is not a new privilege).
-
-    Commands using this helper are also declared with
-    @app_commands.default_permissions(manage_guild=True) and
-    @app_commands.guild_only(), so Discord itself hides the command from
-    users without Manage Server unless a server admin has explicitly
-    granted a role via Server Settings -> Integrations. That means the
-    STAFF_ROLE_IDS / ban_team_role fallbacks only take effect if an admin
-    has opted in to letting those roles see the command in the first place.
-    """
-    member = interaction.user
-    roles = getattr(member, "roles", None)
-    perms = getattr(member, "guild_permissions", None)
-    if roles is None or perms is None:
-        return False
-    role_ids = {r.id for r in roles}
-    if STAFF_ROLE_IDS and (role_ids & STAFF_ROLE_IDS):
-        return True
-    if guild_config and guild_config["ban_team_role"] in role_ids:
-        return True
-    return bool(perms.manage_guild or perms.administrator)
 
 
 def _status_display(status: str) -> str:
@@ -230,7 +199,7 @@ class StaffCog(commands.Cog):
         )
         embed.set_author(
             name="North Florida Police Department  |  Staff Lookup",
-            icon_url=BOT_AVATAR_URL,
+            icon_url=bot_avatar_url(),
         )
 
         # Recent appeals list - guard against Discord embed field limits.

@@ -2,7 +2,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import BOT_AVATAR_URL, COLOUR_PRIMARY
+from config import VOTING_HOURS, bot_avatar_url, COLOUR_PRIMARY
 
 
 class DashboardCog(commands.Cog):
@@ -19,6 +19,7 @@ class DashboardCog(commands.Cog):
         transcripts_channel="Optional. Channel where transcripts are posted on ticket close. Falls back to results channel if omitted.",
     )
     @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
     async def setup(
         self,
         interaction: discord.Interaction,
@@ -72,6 +73,7 @@ class DashboardCog(commands.Cog):
         description="Post the ban appeal dashboard panel in this channel.",
     )
     @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
     async def create_dashboard(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
@@ -109,7 +111,7 @@ def _build_dashboard_embed() -> discord.Embed:
             "**Before you submit:**\n"
             "> Appeals are reviewed by the NFPD Ban Team.\n"
             "> You may only hold one open appeal at a time.\n"
-            "> Reviews take up to 48 hours once forwarded to the team.\n"
+            f"> Voting runs for {VOTING_HOURS} hours once an appeal is forwarded to the team.\n"
             "> Dishonest or frivolous appeals may result in a permanent ban.\n"
             "> Be clear, honest, and respectful in your statement."
         ),
@@ -117,7 +119,7 @@ def _build_dashboard_embed() -> discord.Embed:
     )
     embed.set_author(
         name="North Florida Police Department  |  Ban Appeals",
-        icon_url=BOT_AVATAR_URL,
+        icon_url=bot_avatar_url(),
     )
     embed.set_footer(text="Press the button below to begin your appeal  •  NFPD Ban Appeals")
     return embed

@@ -5,7 +5,7 @@ from typing import Optional
 
 import discord
 
-from config import BOT_AVATAR_URL, COLOUR_CLOSED
+from config import bot_avatar_url, COLOUR_CLOSED
 
 logger = logging.getLogger("appeals-bot.transcript")
 
@@ -77,7 +77,7 @@ def build_transcript_embed(appeal: dict, actioned_by: discord.Member | discord.U
         color=COLOUR_CLOSED,
         timestamp=discord.utils.utcnow(),
     )
-    embed.set_author(name="North Florida Police Department  |  Ban Appeals", icon_url=BOT_AVATAR_URL)
+    embed.set_author(name="North Florida Police Department  |  Ban Appeals", icon_url=bot_avatar_url())
     embed.add_field(name="Roblox Username", value=f"`{appeal['roblox_username']}`", inline=True)
     embed.add_field(name="Discord", value=appeal["discord_tag"], inline=True)
     embed.add_field(name="Appellant", value=f"<@{appeal['appellant_id']}>", inline=True)

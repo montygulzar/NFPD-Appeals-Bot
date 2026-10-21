@@ -5,9 +5,11 @@ from typing import Optional
 import discord
 from discord.ext import commands, tasks
 
+from channels import resolve_channel
+
 from config import (
     APPEAL_COOLDOWN_HOURS,
-    BOT_AVATAR_URL,
+    bot_avatar_url,
     MINIMUM_VOTES,
     COLOUR_ACCEPTED,
     COLOUR_REJECTED,
@@ -159,10 +161,8 @@ async def finalise_appeal(
     results_channel = None
     ticket_channel = None
     if guild and config:
-        if config["results_channel"]:
-            results_channel = guild.get_channel(config["results_channel"])
-        if appeal["ticket_channel"]:
-            ticket_channel = guild.get_channel(appeal["ticket_channel"])
+        results_channel = await resolve_channel(guild, config["results_channel"])
+        ticket_channel = await resolve_channel(guild, appeal["ticket_channel"])
         await _disable_voting_message(guild, config, appeal)
 
     if verdict == "closed":
@@ -195,15 +195,16 @@ async def finalise_appeal(
                 content=ban_team_mention if ch is results_channel else None,
                 embed=embed,
                 view=VerdictPanelView(bot, appeal_id),
+                allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
             )
         except discord.HTTPException:
             logger.warning("Could not post verdict for appeal %s in %s", appeal_id, ch.id)
 
     await db.close_appeal(appeal_id, verdict)
-    await _apply_cooldown(
-        db, appeal,
-        "Appeal accepted" if unban_wins else "Appeal rejected",
-    )
+    if not unban_wins:
+        # Cooldown only follows a denial (or an inconclusive vote, above); an
+        # accepted appellant has nothing to wait out.
+        await _apply_cooldown(db, appeal, "Appeal rejected")
     await _dm_appellant(bot, appeal, verdict=verdict)
     return FinaliseResult(True, verdict, tally, total_votes)
 
@@ -315,7 +316,7 @@ def _build_verdict_embed(appeal, tally: dict, total_votes: int, unban_wins: bool
         ),
         color=colour,
     )
-    embed.set_author(name="North Florida Police Department  |  Verdict", icon_url=BOT_AVATAR_URL)
+    embed.set_author(name="North Florida Police Department  |  Verdict", icon_url=bot_avatar_url())
     embed.add_field(name="Roblox Username", value=f"`{appeal['roblox_username']}`", inline=True)
     embed.add_field(name="Discord", value=appeal["discord_tag"], inline=True)
     embed.add_field(name="Appellant", value=f"<@{appeal['appellant_id']}>", inline=True)
@@ -347,7 +348,7 @@ def _build_inconclusive_embed(appeal, tally: dict, total_votes: int, *, forced: 
     )
     embed.set_author(
         name="North Florida Police Department  |  Inconclusive",
-        icon_url=BOT_AVATAR_URL,
+        icon_url=bot_avatar_url(),
     )
     embed.add_field(name="Roblox Username", value=f"`{appeal['roblox_username']}`", inline=True)
     embed.add_field(name="Discord", value=appeal["discord_tag"], inline=True)
@@ -361,7 +362,7 @@ def _build_inconclusive_embed(appeal, tally: dict, total_votes: int, *, forced: 
 async def _disable_voting_message(guild: discord.Guild, config, appeal):
     if not config["voting_channel"] or not appeal["voting_msg_id"]:
         return
-    voting_channel = guild.get_channel(config["voting_channel"])
+    voting_channel = await resolve_channel(guild, config["voting_channel"])
     if not voting_channel:
         return
     try:

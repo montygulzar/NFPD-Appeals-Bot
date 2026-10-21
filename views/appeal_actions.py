@@ -1,11 +1,15 @@
 import asyncio
+import logging
 from datetime import datetime, timezone, timedelta
 
 import discord
 
-from views.transcript import build_transcript_embed, generate_transcript
+from channels import resolve_channel
+from errors import report_interaction_error
+from permissions import staff_button_check
+from views.transcript import build_transcript_embed, generate_transcript, resolve_transcripts_channel
 from config import (
-    BOT_AVATAR_URL,
+    bot_avatar_url,
     COLOUR_ACCEPTED,
     COLOUR_CLOSED,
     COLOUR_INFO,
@@ -15,24 +19,52 @@ from config import (
     VOTING_HOURS,
 )
 
+logger = logging.getLogger("appeals-bot.tickets")
+
 
 class AppealActionsView(discord.ui.View):
-    """Staff-facing buttons inside the private ticket channel."""
+    """Staff-facing buttons inside the private ticket channel.
+
+    The appellant can see this channel, so every button is staff-gated in
+    interaction_check - otherwise the appellant could forward or close their
+    own appeal.
+    """
 
     def __init__(self, bot, appeal_id: int = 0):
         super().__init__(timeout=None)
         self.bot = bot
         self.appeal_id = appeal_id
 
-    def _resolve_appeal_id(self, channel: discord.TextChannel) -> int | None:
+    async def _resolve_appeal(self, channel: discord.abc.GuildChannel):
+        """Find the appeal for this ticket by its stored ticket_channel id;
+        the channel topic (which staff can edit) is only a legacy fallback."""
+        db = self.bot.db
         if self.appeal_id:
-            return self.appeal_id
-        if channel.topic and "Appeal ID:" in channel.topic:
+            return await db.get_appeal(self.appeal_id)
+        appeal = await db.get_appeal_by_ticket_channel(channel.id)
+        if appeal is not None:
+            return appeal
+        topic = getattr(channel, "topic", None)
+        if topic and "Appeal ID:" in topic:
             try:
-                return int(channel.topic.split("Appeal ID:")[1].strip())
+                return await db.get_appeal(int(topic.split("Appeal ID:")[1].strip()))
             except (ValueError, IndexError):
                 pass
         return None
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        appeal = None
+        try:
+            appeal = await self._resolve_appeal(interaction.channel)
+        except Exception:
+            logger.exception("Could not resolve appeal for ticket permission check")
+        return await staff_button_check(
+            self.bot, interaction,
+            appellant_id=appeal["appellant_id"] if appeal else None,
+        )
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await report_interaction_error(interaction, error, where="ticket action")
 
     @discord.ui.button(
         label="Forward to Ban Team",
@@ -42,21 +74,16 @@ class AppealActionsView(discord.ui.View):
     async def forward_to_ban_team(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True, thinking=True)
 
-        appeal_id = self._resolve_appeal_id(interaction.channel)
-        if not appeal_id:
-            await interaction.followup.send("Could not determine the appeal ID for this ticket.", ephemeral=True)
-            return
-
         db = self.bot.db
-        config = await db.get_guild_config(interaction.guild_id)
+        appeal = await self._resolve_appeal(interaction.channel)
+        if not appeal:
+            await interaction.followup.send("Could not determine the appeal for this ticket.", ephemeral=True)
+            return
+        appeal_id = appeal["id"]
 
+        config = await db.get_guild_config(interaction.guild_id)
         if not config or not config["voting_channel"]:
             await interaction.followup.send("No voting channel configured. Run `/setup` first.", ephemeral=True)
-            return
-
-        appeal = await db.get_appeal(appeal_id)
-        if not appeal:
-            await interaction.followup.send("This appeal could not be found.", ephemeral=True)
             return
 
         if appeal["status"] != "open":
@@ -66,7 +93,7 @@ class AppealActionsView(discord.ui.View):
             )
             return
 
-        voting_channel = interaction.guild.get_channel(config["voting_channel"])
+        voting_channel = await resolve_channel(interaction.guild, config["voting_channel"])
         if not voting_channel:
             await interaction.followup.send("The voting channel could not be found. Check `/setup`.", ephemeral=True)
             return
@@ -79,6 +106,7 @@ class AppealActionsView(discord.ui.View):
             content=ban_team_mention,
             embed=_build_voting_embed(appeal, closes_at),
             view=VotingPanelView(self.bot, appeal_id),
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
         )
 
         # Atomic claim - loses gracefully if another staff double-clicks or
@@ -115,22 +143,38 @@ class AppealActionsView(discord.ui.View):
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.defer(ephemeral=True)
 
-        appeal_id = self._resolve_appeal_id(interaction.channel)
         db = self.bot.db
+        appeal = await self._resolve_appeal(interaction.channel)
+        appeal_id = appeal["id"] if appeal else None
 
-        import logging
-        _logger = logging.getLogger("appeals-bot.transcript")
+        if appeal:
+            status = appeal["status"]
+            # A live vote must be ended through the voting system, not by
+            # deleting the ticket - otherwise the verdict is lost and the
+            # voting message keeps live-looking buttons.
+            if status in ("voting", "finalising"):
+                await interaction.followup.send(
+                    "This appeal is currently being voted on. Wait for voting to end, "
+                    "or use `/force_end_voting` first.",
+                    ephemeral=True,
+                )
+                return
 
-        if appeal_id:
-            appeal = await db.get_appeal(appeal_id)
-            if appeal and appeal["status"] not in ("actioned_unban", "actioned_close"):
-                await db.close_appeal(appeal_id, "closed")
+            # open -> closed (closed before voting); accepted/rejected ->
+            # actioned_close (verdict dismissed). Conditional, so a verdict
+            # can't be overwritten and a double click can't post twice.
+            if status == "open":
+                changed = await db.transition_status(appeal_id, ["open"], "closed")
+            elif status in ("accepted", "rejected"):
+                changed = await db.transition_status(appeal_id, ["accepted", "rejected"], "actioned_close")
+            else:
+                changed = False  # already closed/actioned: just remove the channel
 
+            if changed:
                 config = await db.get_guild_config(interaction.guild_id)
-                from views.transcript import resolve_transcripts_channel
                 target = await resolve_transcripts_channel(interaction.guild, config)
                 if target is None:
-                    _logger.warning(
+                    logger.warning(
                         "No transcripts destination for appeal %s (neither transcripts_channel "
                         "nor results_channel resolves).", appeal_id,
                     )
@@ -140,7 +184,7 @@ class AppealActionsView(discord.ui.View):
                         embed = build_transcript_embed(appeal, interaction.user, "Closed by staff")
                         await target.send(embed=embed, file=transcript_file)
                     except Exception:
-                        _logger.exception("Failed to post transcript for appeal %s", appeal_id)
+                        logger.exception("Failed to post transcript for appeal %s", appeal_id)
 
         await interaction.followup.send("Closing ticket in 5 seconds...", ephemeral=True)
         await asyncio.sleep(5)
@@ -148,8 +192,6 @@ class AppealActionsView(discord.ui.View):
             await interaction.channel.delete(reason=f"Appeal {appeal_id} closed by {interaction.user}")
         except discord.HTTPException:
             pass
-
-
 
 
 def _build_voting_embed(appeal, closes_at: datetime) -> discord.Embed:
@@ -165,7 +207,7 @@ def _build_voting_embed(appeal, closes_at: datetime) -> discord.Embed:
         ),
         color=COLOUR_VOTING,
     )
-    embed.set_author(name="North Florida Police Department  |  Ban Team Vote", icon_url=BOT_AVATAR_URL)
+    embed.set_author(name="North Florida Police Department  |  Ban Team Vote", icon_url=bot_avatar_url())
     embed.add_field(name="Banned on", value=appeal.get("platform", "Unknown"), inline=True)
     embed.add_field(name="Roblox Username", value=f"`{appeal['roblox_username']}`", inline=True)
     embed.add_field(name="Discord", value=appeal["discord_tag"], inline=True)

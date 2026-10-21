@@ -5,7 +5,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import BOT_AVATAR_URL, COLOUR_PRIMARY
+import modbot_client
+from config import MAIN_GUILD_ID, bot_avatar_url, COLOUR_PRIMARY
 
 logger = logging.getLogger("appeals-bot.debug")
 
@@ -16,6 +17,7 @@ class DebugCog(commands.Cog):
 
     @app_commands.command(name="debug", description="Run a full health check on the appeals bot.")
     @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
     async def debug(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
@@ -125,7 +127,28 @@ class DebugCog(commands.Cog):
             else:
                 results.append("Recent appeals: none found")
         except Exception as exc:
-            results.append(f"Recent appeals: FAIL - {exc}")
+            results.append(f"Recent appeals: FAIL - {type(exc).__name__}")
+
+        # 8. Orphaned appeals: 'open' with no ticket channel. These block the
+        # user from appealing again and can't be closed from Discord.
+        try:
+            orphans = await self.bot.db.find_orphan_appeals(interaction.guild_id)
+            if orphans:
+                ids = ", ".join(f"#{o['id']}" for o in orphans[:15])
+                results.append(
+                    f"Orphaned appeals (open, no ticket): {len(orphans)} - {ids}\n"
+                    "  Fix: UPDATE appeals SET status='closed' WHERE id IN (...);"
+                )
+            else:
+                results.append("Orphaned appeals: none")
+        except Exception as exc:
+            results.append(f"Orphaned appeals: FAIL - {type(exc).__name__}")
+
+        # 9. Mod Bot link used by Execute Unban
+        if modbot_client.is_configured():
+            results.append(f"Mod Bot unban link: configured (main guild {MAIN_GUILD_ID})")
+        else:
+            results.append("Mod Bot unban link: NOT configured - Execute Unban will refuse")
 
         embed = discord.Embed(
             title="Appeals Bot - Health Check",
@@ -133,5 +156,5 @@ class DebugCog(commands.Cog):
             color=COLOUR_PRIMARY,
             timestamp=discord.utils.utcnow(),
         )
-        embed.set_author(name="North Florida Police Department  |  Debug", icon_url=BOT_AVATAR_URL)
+        embed.set_author(name="North Florida Police Department  |  Debug", icon_url=bot_avatar_url())
         await interaction.followup.send(embed=embed, ephemeral=True)

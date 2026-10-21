@@ -31,16 +31,15 @@ services:
         max-size: "10m"
         max-file: "5"
     healthcheck:
-      # Cheap process liveness check: if the interpreter can import the
-      # config module the process is at least up. Discord/Postgres readiness
-      # is logged rather than exposed here because Docker HEALTHCHECK failures
-      # do NOT restart the container by themselves - `restart: unless-stopped`
-      # handles crash recovery.
-      test: ["CMD", "python", "-c", "import config"]
-      interval: 60s
-      timeout: 10s
+      # Probes /ready (Discord logged in AND PostgreSQL answering) on the
+      # in-container health server. The port is NOT published to the host.
+      # An unhealthy container is flagged in `docker ps`; Docker does not
+      # restart it for that alone - `restart: unless-stopped` covers crashes.
+      test: ["CMD", "python", "healthcheck.py"]
+      interval: 30s
+      timeout: 5s
       retries: 3
-      start_period: 30s
+      start_period: 90s
 
 networks:
   nodey-monitoring:

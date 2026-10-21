@@ -12,7 +12,7 @@ os.environ.setdefault("DISCORD_TOKEN", "test")
 os.environ.setdefault("DATABASE_URL", "postgresql://test/test")
 
 # Force re-import with a controlled env so STAFF_ROLE_IDS is empty by default.
-for m in ("config", "cogs.staff"):
+for m in ("config", "permissions", "cogs.staff"):
     sys.modules.pop(m, None)
 
 
@@ -66,7 +66,7 @@ def test_staff_role_ids_env_grants_access(monkeypatch):
     monkeypatch.setenv("DISCORD_TOKEN", "x")
     monkeypatch.setenv("DATABASE_URL", "postgresql://x/y")
     monkeypatch.setenv("STAFF_ROLE_IDS", "555")
-    for m in ("config", "cogs.staff"):
+    for m in ("config", "permissions", "cogs.staff"):
         sys.modules.pop(m, None)
     from cogs.staff import _is_appeals_staff
     inter = _interaction(_member(role_ids=[555]))
