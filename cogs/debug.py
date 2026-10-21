@@ -5,8 +5,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+import config as app_config
 import modbot_client
-from config import MAIN_GUILD_ID, bot_avatar_url, COLOUR_PRIMARY
+from config import MAIN_GUILD_ID, bot_avatar_url, COLOUR_ACCEPTED, COLOUR_PRIMARY, COLOUR_REJECTED
 
 logger = logging.getLogger("appeals-bot.debug")
 
@@ -158,3 +159,75 @@ class DebugCog(commands.Cog):
         )
         embed.set_author(name="North Florida Police Department  |  Debug", icon_url=bot_avatar_url())
         await interaction.followup.send(embed=embed, ephemeral=True)
+
+    @app_commands.command(
+        name="test_modbot_link",
+        description="Test the Execute Unban link to the Mod Bot without unbanning anyone.",
+    )
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def test_modbot_link(self, interaction: discord.Interaction):
+        """Dry run of the Execute Unban path.
+
+        Sends the real unban request, but for this Appeals Bot's own account,
+        which isn't banned in the main server. A healthy link answers
+        "not_banned". That one round trip proves the network path, the shared
+        token, MAIN_GUILD_ID, the Mod Bot being in that server, and its Ban
+        Members permission (Discord checks the permission before looking the
+        ban up). No ban is lifted and no mod-log case is recorded.
+        """
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        lines = []
+        passed = True
+
+        def check(ok: bool, text: str) -> None:
+            nonlocal passed
+            passed = passed and ok
+            lines.append(f"{'✅' if ok else '❌'} {text}")
+
+        # 1. Config present (never echo the token itself).
+        check(bool(app_config.MODBOT_API_URL), f"MODBOT_API_URL: {app_config.MODBOT_API_URL or 'not set'}")
+        token_len = len(app_config.INTERNAL_API_TOKEN)
+        check(token_len > 0, f"INTERNAL_API_TOKEN: {'set (' + str(token_len) + ' chars)' if token_len else 'not set'}")
+        check(bool(app_config.MAIN_GUILD_ID), f"MAIN_GUILD_ID: {app_config.MAIN_GUILD_ID or 'not set'}")
+
+        if not modbot_client.is_configured():
+            lines.append("\nFix the settings above in the Appeals Bot's .env, then restart it.")
+            await interaction.followup.send(embed=_link_embed(False, lines), ephemeral=True)
+            return
+
+        # 2. Mod Bot reachable and healthy (read-only).
+        ready_ok, ready_detail = await modbot_client.check_ready()
+        check(ready_ok, f"Mod Bot reachable and ready: {ready_detail}")
+
+        # 3. Authenticated dry-run unban of our own account.
+        result = await modbot_client.request_unban(
+            user_id=self.bot.user.id,
+            moderator_id=interaction.user.id,
+            appeal_id=0,
+            reason=f"Link test from Appeals Bot /test_modbot_link by {interaction.user}",
+        )
+        if result.status == modbot_client.NOT_BANNED:
+            check(True, "Token accepted, main server found, Ban Members OK (dry run: nothing was unbanned)")
+        elif result.status == modbot_client.UNBANNED:
+            # Only possible if this bot's own account was banned in the main server.
+            check(True, "Token accepted - note: this Appeals Bot's account WAS banned in the main server and has been unbanned")
+        elif result.status == modbot_client.FORBIDDEN:
+            check(False, f"Mod Bot refused: {result.detail or 'forbidden'} (needs Ban Members in the main server, and MAIN_GUILD_ID in its APPROVED_GUILD_IDS)")
+        else:
+            check(False, f"Unban request failed: {result.detail or result.status}")
+
+        if passed:
+            lines.append("\nExecute Unban is ready to use.")
+        await interaction.followup.send(embed=_link_embed(passed, lines), ephemeral=True)
+
+
+def _link_embed(passed: bool, lines: list[str]) -> discord.Embed:
+    embed = discord.Embed(
+        title="Mod Bot Link Test - " + ("PASSED" if passed else "FAILED"),
+        description="\n".join(lines),
+        color=COLOUR_ACCEPTED if passed else COLOUR_REJECTED,
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_author(name="North Florida Police Department  |  Debug", icon_url=bot_avatar_url())
+    return embed
