@@ -83,3 +83,24 @@ async def request_unban(*, user_id: int, moderator_id: int, appeal_id: int, reas
         # Never log the token; the URL is internal and safe to show.
         logger.warning("Mod Bot unban request to %s failed: %s", url, type(exc).__name__)
         return UnbanResult(UNREACHABLE, f"Could not reach the Mod Bot ({type(exc).__name__}).")
+
+
+async def check_ready() -> tuple[bool, str]:
+    """GET the Mod Bot's /ready. Read-only; used by /test_modbot_link."""
+    if not config.MODBOT_API_URL:
+        return False, "MODBOT_API_URL is not set."
+    timeout = aiohttp.ClientTimeout(total=config.MODBOT_TIMEOUT_SECONDS)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(f"{config.MODBOT_API_URL}/ready") as resp:
+                try:
+                    body = await resp.json(content_type=None)
+                except (aiohttp.ContentTypeError, ValueError):
+                    body = {}
+                if resp.status == 200:
+                    return True, "ready"
+                discord_detail = (body.get("discord") or {}).get("detail", "?")
+                db_ok = (body.get("database") or {}).get("ok")
+                return False, f"HTTP {resp.status} (discord: {discord_detail}, database ok: {db_ok})"
+    except (aiohttp.ClientError, TimeoutError) as exc:
+        return False, f"unreachable ({type(exc).__name__})"

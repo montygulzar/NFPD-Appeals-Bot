@@ -65,6 +65,7 @@ Key variables:
 | `/user_appeal_history <user>` | Appeals staff | Show a user's appeal history and recent cases |
 | `/remove_cooldown <user>` | Appeals staff | End a user's appeal cooldown early |
 | `/debug` | Administrator | Full health check |
+| `/test_modbot_link` | Administrator | Dry-run the Execute Unban link to the Mod Bot (unbans nobody) |
 
 Appeals staff = role in `STAFF_ROLE_IDS`, or the ban-team role configured via
 `/setup`, or Discord's `Manage Server`.

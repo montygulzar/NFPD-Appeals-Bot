@@ -650,3 +650,63 @@ async def test_unapproved_guild_reported_once_across_reconnects(monkeypatch):
     await b.on_ready()
     await b.on_ready()   # gateway reconnect
     assert handled == [2]
+
+
+# ---------------------------------------------------------------------------
+# /test_modbot_link
+# ---------------------------------------------------------------------------
+
+async def _run_link_test(monkeypatch, *, unban_status, ready=(True, "ready"), token="t0ken-value"):
+    from cogs import debug as debug_mod
+    # Other test modules reload `config`, so patch the exact module objects
+    # the command and client read from.
+    for cfg in {id(m): m for m in (debug_mod.app_config, modbot_client.config)}.values():
+        monkeypatch.setattr(cfg, "MODBOT_API_URL", "http://nfpd-mod-bot:8080")
+        monkeypatch.setattr(cfg, "INTERNAL_API_TOKEN", token)
+        monkeypatch.setattr(cfg, "MAIN_GUILD_ID", 555)
+    calls = []
+
+    async def fake_ready():
+        return ready
+
+    async def fake_unban(**kw):
+        calls.append(kw)
+        return modbot_client.UnbanResult(unban_status, "detail text")
+    monkeypatch.setattr(modbot_client, "check_ready", fake_ready)
+    monkeypatch.setattr(modbot_client, "request_unban", fake_unban)
+
+    bot = SimpleNamespace(user=SimpleNamespace(id=999))
+    cog = debug_mod.DebugCog(bot)
+    inter = interaction(member(user_id=7, admin=True))
+    await cog.test_modbot_link.callback(cog, inter)
+    return inter.followup.sent[0], calls
+
+
+@pytest.mark.asyncio
+async def test_link_test_passes_on_not_banned_dry_run(monkeypatch):
+    embed, calls = await _run_link_test(monkeypatch, unban_status=modbot_client.NOT_BANNED)
+    assert "PASSED" in embed.title
+    # The dry run targets the Appeals Bot's own account, never a real user.
+    assert calls[0]["user_id"] == 999
+    assert "t0ken-value" not in embed.description
+
+
+@pytest.mark.asyncio
+async def test_link_test_fails_on_missing_ban_permission(monkeypatch):
+    embed, _ = await _run_link_test(monkeypatch, unban_status=modbot_client.FORBIDDEN)
+    assert "FAILED" in embed.title and "Ban Members" in embed.description
+
+
+@pytest.mark.asyncio
+async def test_link_test_fails_when_modbot_down(monkeypatch):
+    embed, _ = await _run_link_test(
+        monkeypatch, unban_status=modbot_client.UNREACHABLE, ready=(False, "unreachable (ClientConnectorError)"),
+    )
+    assert "FAILED" in embed.title and "unreachable" in embed.description
+
+
+@pytest.mark.asyncio
+async def test_link_test_reports_missing_settings_without_calling_modbot(monkeypatch):
+    embed, calls = await _run_link_test(monkeypatch, unban_status=modbot_client.NOT_BANNED, token="")
+    assert "FAILED" in embed.title and "INTERNAL_API_TOKEN: not set" in embed.description
+    assert calls == []
