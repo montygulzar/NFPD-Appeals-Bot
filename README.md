@@ -45,6 +45,11 @@ Key variables:
 | `DB_CONNECT_MAX_WAIT` | Startup wait for PostgreSQL (default 120s) |
 | `DB_POOL_MIN` / `DB_POOL_MAX` | asyncpg pool sizing |
 | `LOG_LEVEL` | INFO / DEBUG / WARNING / ERROR |
+| `HEALTH_PORT` | Internal health server port (default 8080, not published) |
+| `MODBOT_API_URL` | Mod Bot internal API, e.g. `http://nfpd-mod-bot:8080` |
+| `INTERNAL_API_TOKEN` | Shared secret; same value in the Mod Bot's `.env` |
+| `MAIN_GUILD_ID` | Main NFPD server where bans live (Execute Unban target) |
+| `MODBOT_TIMEOUT_SECONDS` | Timeout for the Mod Bot unban call (default 15) |
 
 ---
 
@@ -100,6 +105,27 @@ schema in place is safe.
 
 ---
 
+## Execute Unban and the Mod Bot
+
+Appellants are banned in the **main NFPD server**, not the appeals server, so
+the Appeals bot doesn't unban anyone itself. Pressing **Execute Unban** sends
+an authenticated request to the NFPD Mod Bot over the private
+`nodey-monitoring` network (`POST /internal/unban`). The Mod Bot lifts the ban
+in `MAIN_GUILD_ID` and records an `unban` case in its mod log.
+
+- If the Mod Bot is unreachable or refuses, the appeal **stays Accepted** and
+  staff are told why, so they can press the button again once it's fixed.
+- If the user wasn't banned any more, the appeal is marked actioned anyway.
+- Only Appeals staff can press any ticket or verdict button. The appellant
+  can see their ticket, but can't forward, close or action it.
+
+## Health
+
+`/health` (liveness) and `/ready` (Discord logged in + PostgreSQL answering)
+are served on `HEALTH_PORT` inside the container. The Docker HEALTHCHECK probes
+`/ready`. An unhealthy container is flagged in `docker ps`; Docker does not
+restart it for that alone.
+
 ## Appeal flow
 
 1. Member clicks **Submit a Ban Appeal** on the dashboard panel
@@ -111,3 +137,18 @@ schema in place is safe.
    member runs `/force_end_voting <id>` to close early. Both paths go through
    the same `finalise_appeal()` function, so the outcome is identical.
 7. Staff action the verdict; the ticket channel is transcribed and deleted.
+
+---
+
+## `/setup` — channels and roles
+
+Run once per server (Administrator):
+
+- `dashboard_channel` — text channel where `/createdashboard` posts the public "Submit a Ban Appeal" panel.
+- `ticket_category` — Discord category where new private ticket channels are created. **Required.**
+- `voting_channel` — where the ban team votes.
+- `results_channel` — where the verdict embed lands. Also the fallback destination for transcripts.
+- `ban_team_role` — role pinged on new appeals and used as the default staff role.
+- `transcripts_channel` — optional. If set, ticket transcripts on close land here instead of `results_channel`.
+
+Existing servers upgrading from an earlier version **must re-run `/setup`** to specify `ticket_category`. Until they do, appeal submissions will ephemerally refuse with an actionable message rather than creating tickets in the wrong place.

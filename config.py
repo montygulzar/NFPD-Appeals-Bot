@@ -116,6 +116,25 @@ DB_POOL_MIN: int = _parse_int("DB_POOL_MIN", default=1)
 DB_POOL_MAX: int = _parse_int("DB_POOL_MAX", default=5)
 LOG_LEVEL: str = (os.environ.get("LOG_LEVEL", "INFO").strip() or "INFO").upper()
 
+# HTTP health server (/health liveness, /ready readiness). Not published to
+# the host by docker-compose; reachable only inside the Docker network.
+HEALTH_PORT: int = _parse_int("HEALTH_PORT", default=8080)
+
+# ── Mod Bot integration (Execute Unban) ───────────────────────────────────────
+#
+# Appellants are banned in the main NFPD server, not the appeals server, so
+# Execute Unban asks the NFPD Mod Bot to perform the unban there (which also
+# records a mod-log case). All three must be set for the button to work.
+#
+#   MODBOT_API_URL      e.g. http://nfpd-mod-bot:8080  (over nodey-monitoring)
+#   INTERNAL_API_TOKEN  shared secret; must match the Mod Bot's value
+#   MAIN_GUILD_ID       the main NFPD server ID where the bans live
+
+MODBOT_API_URL: str = os.environ.get("MODBOT_API_URL", "").strip().rstrip("/")
+INTERNAL_API_TOKEN: str = os.environ.get("INTERNAL_API_TOKEN", "").strip()
+MAIN_GUILD_ID: int = _parse_int("MAIN_GUILD_ID", default=0)
+MODBOT_TIMEOUT_SECONDS: int = _parse_int("MODBOT_TIMEOUT_SECONDS", default=15)
+
 # ── Brand ─────────────────────────────────────────────────────────────────────
 
 COLOUR_PRIMARY  = 0x0D1117
@@ -133,5 +152,12 @@ UNAUTHORISED_GUILD_MESSAGE = (
     "**Discord ID:** `1285998518213017663`"
 )
 
-# Bot avatar URL - set at startup in on_ready so all embed builders can reference it.
+# Bot avatar URL - set at startup in on_ready.
 BOT_AVATAR_URL: str | None = None
+
+
+def bot_avatar_url() -> str | None:
+    """Read at embed-build time. Modules must call this rather than doing
+    `from config import BOT_AVATAR_URL`, which copies the import-time None
+    and never sees the value on_ready sets."""
+    return BOT_AVATAR_URL

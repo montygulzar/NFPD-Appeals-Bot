@@ -2,8 +2,10 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from channels import resolve_channel
+
 from config import (
-    BOT_AVATAR_URL,
+    bot_avatar_url,
     VOTING_HOURS,
     COLOUR_INFO,
     COLOUR_VOTING,
@@ -23,6 +25,7 @@ class AppealsCog(commands.Cog):
         description="Manually forward this ticket's appeal to the ban team for voting.",
     )
     @app_commands.default_permissions(manage_guild=True)
+    @app_commands.guild_only()
     async def forward_to_ban_team(self, interaction: discord.Interaction):
         """
         Fallback for when the in-ticket button is unavailable (e.g. message deleted).
@@ -32,27 +35,22 @@ class AppealsCog(commands.Cog):
         db = self.bot.db
         channel = interaction.channel
 
-        if not channel.topic or "Appeal ID:" not in channel.topic:
+        # Look the ticket up by its stored channel id; the topic (editable by
+        # staff) is only a fallback for tickets created before that existed.
+        appeal = await db.get_appeal_by_ticket_channel(channel.id)
+        if appeal is None and getattr(channel, "topic", None) and "Appeal ID:" in channel.topic:
+            try:
+                appeal = await db.get_appeal(int(channel.topic.split("Appeal ID:")[1].strip()))
+            except (ValueError, IndexError):
+                appeal = None
+        if not appeal or appeal["guild_id"] != interaction.guild_id:
             await interaction.followup.send(
                 "This channel does not appear to be an appeal ticket. "
                 "Run this command inside a ticket channel.",
                 ephemeral=True,
             )
             return
-
-        try:
-            appeal_id = int(channel.topic.split("Appeal ID:")[1].strip())
-        except (ValueError, IndexError):
-            await interaction.followup.send(
-                "Could not parse the appeal ID from this channel's topic.",
-                ephemeral=True,
-            )
-            return
-
-        appeal = await db.get_appeal(appeal_id)
-        if not appeal:
-            await interaction.followup.send("No appeal found with that ID.", ephemeral=True)
-            return
+        appeal_id = appeal["id"]
 
         if appeal["status"] != "open":
             await interaction.followup.send(
@@ -68,7 +66,7 @@ class AppealsCog(commands.Cog):
             )
             return
 
-        voting_channel = interaction.guild.get_channel(config["voting_channel"])
+        voting_channel = await resolve_channel(interaction.guild, config["voting_channel"])
         if not voting_channel:
             await interaction.followup.send(
                 "Cannot find the configured voting channel.", ephemeral=True
@@ -86,6 +84,7 @@ class AppealsCog(commands.Cog):
             content=ban_team_mention,
             embed=_build_voting_embed(appeal, closes_at),
             view=VotingPanelView(self.bot, appeal_id),
+            allowed_mentions=discord.AllowedMentions(roles=True, users=False, everyone=False),
         )
 
         # Atomic claim: only succeeds if the appeal is still 'open'. If another
@@ -115,6 +114,7 @@ class AppealsCog(commands.Cog):
     )
     @app_commands.describe(appeal_id="The numeric appeal ID")
     @app_commands.default_permissions(manage_guild=True)
+    @app_commands.guild_only()
     async def appeal_info(self, interaction: discord.Interaction, appeal_id: int):
         await interaction.response.defer(ephemeral=True)
         appeal = await self.bot.db.get_appeal(appeal_id)
@@ -132,7 +132,7 @@ class AppealsCog(commands.Cog):
         )
         embed.set_author(
             name="North Florida Police Department  |  Case File",
-            icon_url=BOT_AVATAR_URL,
+            icon_url=bot_avatar_url(),
         )
 
         status_display = status.replace("_", " ").title()

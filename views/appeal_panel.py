@@ -1,4 +1,7 @@
 import discord
+
+from config import APPEAL_COOLDOWN_HOURS
+from errors import report_interaction_error
 from views.appeal_modal import AppealModal
 
 
@@ -22,4 +25,17 @@ class AppealPanelView(discord.ui.View):
                 ephemeral=True,
             )
             return
+        if APPEAL_COOLDOWN_HOURS > 0:
+            # Tell them before they fill in the form, not after.
+            cooldown = await self.bot.db.get_active_cooldown(interaction.guild_id, interaction.user.id)
+            if cooldown:
+                await interaction.response.send_message(
+                    "You are currently on an appeal cooldown. You may submit a new "
+                    f"appeal <t:{int(cooldown['expires_at'].timestamp())}:R>.",
+                    ephemeral=True,
+                )
+                return
         await interaction.response.send_modal(AppealModal(self.bot))
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await report_interaction_error(interaction, error, where="appeal panel")

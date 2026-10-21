@@ -5,7 +5,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import BOT_AVATAR_URL, COLOUR_PRIMARY
+import modbot_client
+from config import MAIN_GUILD_ID, bot_avatar_url, COLOUR_PRIMARY
 
 logger = logging.getLogger("appeals-bot.debug")
 
@@ -16,6 +17,7 @@ class DebugCog(commands.Cog):
 
     @app_commands.command(name="debug", description="Run a full health check on the appeals bot.")
     @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
     async def debug(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
 
@@ -39,10 +41,17 @@ class DebugCog(commands.Cog):
 
             # 3. Channel permission checks
             channel_checks = {
-                "Appeals channel": (config["appeals_channel"], ["view_channel", "send_messages", "manage_channels"]),
-                "Voting channel":  (config["voting_channel"],  ["view_channel", "send_messages", "embed_links"]),
-                "Results channel": (config["results_channel"], ["view_channel", "send_messages", "embed_links", "attach_files"]),
+                "Dashboard channel": (config["appeals_channel"], ["view_channel", "send_messages"]),
+                "Voting channel":    (config["voting_channel"],  ["view_channel", "send_messages", "embed_links"]),
+                "Results channel":   (config["results_channel"], ["view_channel", "send_messages", "embed_links", "attach_files"]),
             }
+            if config["transcripts_channel"]:
+                channel_checks["Transcripts channel"] = (
+                    config["transcripts_channel"],
+                    ["view_channel", "send_messages", "embed_links", "attach_files"],
+                )
+            else:
+                results.append("Transcripts channel: not configured (falls back to results channel)")
             for label, (channel_id, required_perms) in channel_checks.items():
                 if not channel_id:
                     results.append(f"{label}: not configured")
@@ -74,6 +83,22 @@ class DebugCog(commands.Cog):
                     except discord.HTTPException as exc:
                         results.append(f"Voting channel edit test: FAIL - {exc}")
 
+            # Ticket category
+            tc_id = config["ticket_category"]
+            if not tc_id:
+                results.append("Ticket category: NOT configured - staff must re-run /setup")
+            else:
+                cat = interaction.guild.get_channel(tc_id)
+                if not isinstance(cat, discord.CategoryChannel):
+                    results.append(f"Ticket category: configured (ID {tc_id}) but not found or not a category")
+                else:
+                    me = interaction.guild.me
+                    perms = cat.permissions_for(me)
+                    if not perms.manage_channels:
+                        results.append(f"Ticket category: {cat.name} - missing manage_channels")
+                    else:
+                        results.append(f"Ticket category: {cat.name} - OK")
+
             # 5. Ban team role
             if not config["ban_team_role"]:
                 results.append("Ban team role: not configured")
@@ -102,7 +127,28 @@ class DebugCog(commands.Cog):
             else:
                 results.append("Recent appeals: none found")
         except Exception as exc:
-            results.append(f"Recent appeals: FAIL - {exc}")
+            results.append(f"Recent appeals: FAIL - {type(exc).__name__}")
+
+        # 8. Orphaned appeals: 'open' with no ticket channel. These block the
+        # user from appealing again and can't be closed from Discord.
+        try:
+            orphans = await self.bot.db.find_orphan_appeals(interaction.guild_id)
+            if orphans:
+                ids = ", ".join(f"#{o['id']}" for o in orphans[:15])
+                results.append(
+                    f"Orphaned appeals (open, no ticket): {len(orphans)} - {ids}\n"
+                    "  Fix: UPDATE appeals SET status='closed' WHERE id IN (...);"
+                )
+            else:
+                results.append("Orphaned appeals: none")
+        except Exception as exc:
+            results.append(f"Orphaned appeals: FAIL - {type(exc).__name__}")
+
+        # 9. Mod Bot link used by Execute Unban
+        if modbot_client.is_configured():
+            results.append(f"Mod Bot unban link: configured (main guild {MAIN_GUILD_ID})")
+        else:
+            results.append("Mod Bot unban link: NOT configured - Execute Unban will refuse")
 
         embed = discord.Embed(
             title="Appeals Bot - Health Check",
@@ -110,5 +156,5 @@ class DebugCog(commands.Cog):
             color=COLOUR_PRIMARY,
             timestamp=discord.utils.utcnow(),
         )
-        embed.set_author(name="North Florida Police Department  |  Debug", icon_url=BOT_AVATAR_URL)
+        embed.set_author(name="North Florida Police Department  |  Debug", icon_url=bot_avatar_url())
         await interaction.followup.send(embed=embed, ephemeral=True)

@@ -1,8 +1,12 @@
-from datetime import datetime, timezone
+import logging
 
 import discord
 
-from config import BAN_TEAM_ROLE_IDS, BOT_AVATAR_URL, COLOUR_ACCEPTED, COLOUR_REJECTED
+from config import BAN_TEAM_ROLE_IDS, bot_avatar_url, COLOUR_ACCEPTED, COLOUR_REJECTED
+from errors import report_interaction_error
+from permissions import is_appeals_staff
+
+logger = logging.getLogger("appeals-bot.voting")
 
 
 def _build_vote_bar(unban: int, keep: int) -> str:
@@ -19,30 +23,46 @@ class VotingPanelView(discord.ui.View):
         self.bot = bot
         self.appeal_id = appeal_id
 
-    def _resolve_appeal_id(self, message: discord.Message) -> int | None:
+    async def _resolve_appeal(self, message: discord.Message):
+        """Find the appeal behind this voting message.
+
+        Looks it up by the stored voting_msg_id first, so it doesn't depend on
+        embed text. The footer parse is kept for messages from before
+        voting_msg_id was reliably stored.
+        """
+        db = self.bot.db
         if self.appeal_id:
-            return self.appeal_id
+            return await db.get_appeal(self.appeal_id)
+        appeal = await db.get_appeal_by_voting_msg(message.id)
+        if appeal is not None:
+            return appeal
         try:
             footer = message.embeds[0].footer.text
             part = footer.split("Appeal ID:")[1].strip().split()[0].rstrip("|").strip()
-            return int(part)
+            return await db.get_appeal(int(part))
         except (IndexError, ValueError, AttributeError):
             return None
 
     async def _can_vote(self, interaction: discord.Interaction) -> bool:
-        member_role_ids = {role.id for role in interaction.user.roles}
+        """Ban team only. Fails closed: if no voter role is configured, or the
+        guild config can't be read, only Appeals staff may vote."""
+        member_role_ids = {role.id for role in getattr(interaction.user, "roles", [])}
         if BAN_TEAM_ROLE_IDS and (member_role_ids & BAN_TEAM_ROLE_IDS):
             return True
         try:
             config = await self.bot.db.get_guild_config(interaction.guild_id)
-            db_role_id = config["ban_team_role"] if config else None
         except Exception:
-            db_role_id = None
+            logger.exception("Vote permission check could not read guild config")
+            return is_appeals_staff(interaction, None)
+        db_role_id = config["ban_team_role"] if config else None
         if db_role_id and db_role_id in member_role_ids:
             return True
         if not BAN_TEAM_ROLE_IDS and not db_role_id:
-            return True
+            return is_appeals_staff(interaction, config)
         return False
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception, item) -> None:
+        await report_interaction_error(interaction, error, where="vote")
 
     @discord.ui.button(label="Unban", style=discord.ButtonStyle.success, custom_id="votes:unban", emoji="🟢")
     async def vote_unban(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -61,62 +81,53 @@ class VotingPanelView(discord.ui.View):
             )
             return
 
-        appeal_id = self._resolve_appeal_id(interaction.message)
-        if not appeal_id:
+        appeal = await self._resolve_appeal(interaction.message)
+        if not appeal:
             await interaction.followup.send(
                 "Could not determine which appeal this belongs to. Contact an admin.", ephemeral=True
             )
             return
+        appeal_id = appeal["id"]
+
+        if appeal["appellant_id"] == interaction.user.id:
+            await interaction.followup.send("You cannot vote on your own appeal.", ephemeral=True)
+            return
 
         db = self.bot.db
-        appeal = await db.get_appeal(appeal_id)
-        if not appeal:
-            await interaction.followup.send("This appeal could not be found.", ephemeral=True)
+        accepted, previous_vote, status = await db.record_vote(appeal_id, interaction.user.id, vote)
+        if not accepted:
+            if status == "voting":
+                text = "The voting window for this appeal has closed."
+            elif status:
+                text = f"This appeal is {status.replace('_', ' ')} and is no longer accepting votes."
+            else:
+                text = "This appeal could not be found."
+            await interaction.followup.send(text, ephemeral=True)
             return
 
-        if appeal["status"] != "voting":
-            await interaction.followup.send(
-                f"This appeal is {appeal['status'].replace('_', ' ')} and is no longer accepting votes.",
-                ephemeral=True,
-            )
-            return
-
-        if appeal["closes_at"]:
-            closes_at = appeal["closes_at"]
-            if closes_at.tzinfo is None:
-                closes_at = closes_at.replace(tzinfo=timezone.utc)
-            if closes_at < datetime.now(timezone.utc):
-                await interaction.followup.send("The voting window for this appeal has closed.", ephemeral=True)
-                return
-
-        previous = await db.get_vote(appeal_id, interaction.user.id)
-        await db.upsert_vote(appeal_id, interaction.user.id, vote)
         tally = await db.get_vote_tally(appeal_id)
 
         try:
             fresh = await interaction.channel.fetch_message(interaction.message.id)
             await _update_vote_embed(fresh, tally)
         except Exception as exc:
-            import logging
-            logging.getLogger("appeals-bot.voting").warning(
-                "Failed to update voting embed for appeal %s: %s", appeal_id, exc
-            )
+            logger.warning("Failed to update voting embed for appeal %s: %s", appeal_id, exc)
 
         label = "Unban" if vote == "unban" else "Keep Banned"
         total = tally["unban"] + tally["keep_banned"]
         bar = _build_vote_bar(tally["unban"], tally["keep_banned"])
 
-        if previous and previous["vote"] == vote:
+        if previous_vote == vote:
             msg = f"You have already voted **{label}**."
-        elif previous:
-            old_label = "Unban" if previous["vote"] == "unban" else "Keep Banned"
+        elif previous_vote:
+            old_label = "Unban" if previous_vote == "unban" else "Keep Banned"
             msg = f"Vote changed from **{old_label}** to **{label}**."
         else:
             msg = f"**{label}** vote recorded."
 
         color = COLOUR_ACCEPTED if vote == "unban" else COLOUR_REJECTED
         reply = discord.Embed(color=color)
-        reply.set_author(name="North Florida Police Department  |  Ban Team Vote", icon_url=BOT_AVATAR_URL)
+        reply.set_author(name="North Florida Police Department  |  Ban Team Vote", icon_url=bot_avatar_url())
         reply.description = msg
         reply.add_field(
             name="Current Tally",
