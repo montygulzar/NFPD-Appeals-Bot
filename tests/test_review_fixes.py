@@ -710,3 +710,158 @@ async def test_link_test_reports_missing_settings_without_calling_modbot(monkeyp
     embed, calls = await _run_link_test(monkeypatch, unban_status=modbot_client.NOT_BANNED, token="")
     assert "FAILED" in embed.title and "INTERNAL_API_TOKEN: not set" in embed.description
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Round 3: transcripts, inconclusive close, /appealinfo verdict fallback
+# ---------------------------------------------------------------------------
+
+class _HistoryChannel:
+    def __init__(self, messages):
+        self._messages = messages
+
+    def history(self, limit=None, oldest_first=False):
+        async def gen():
+            for m in self._messages[:limit]:
+                yield m
+        return gen()
+
+
+def _msg(content, attachments=(), author="appellant"):
+    from datetime import datetime, timezone
+    return SimpleNamespace(
+        content=content, embeds=[], attachments=list(attachments),
+        created_at=datetime(2026, 10, 30, 12, 0, tzinfo=timezone.utc),
+        author=SimpleNamespace(bot=False, __str__=lambda: author),
+    )
+
+
+def _transcript_text(file):
+    file.fp.seek(0)
+    return file.fp.read().decode()
+
+
+@pytest.mark.asyncio
+async def test_transcript_includes_attachments():
+    from views.transcript import generate_transcript
+    shot = SimpleNamespace(filename="evidence.png", url="https://cdn.discordapp.com/x/evidence.png")
+    channel = _HistoryChannel([_msg("here is proof", [shot]), _msg("", [shot])])
+    appeal = {"id": 9, "roblox_username": "u", "discord_tag": "u", "status": "closed"}
+    text = _transcript_text(await generate_transcript(channel, appeal))
+    assert text.count("[Attachment] evidence.png: https://cdn.discordapp.com/x/evidence.png") == 2
+
+
+@pytest.mark.asyncio
+async def test_transcript_no_longer_silently_stops_at_500(monkeypatch):
+    import views.transcript as tr
+    channel = _HistoryChannel([_msg(f"line {i}") for i in range(800)])
+    appeal = {"id": 9, "roblox_username": "u", "discord_tag": "u", "status": "closed"}
+    text = _transcript_text(await tr.generate_transcript(channel, appeal))
+    assert "line 799" in text and "truncated" not in text
+
+    monkeypatch.setattr(tr, "TRANSCRIPT_MESSAGE_LIMIT", 100)
+    text = _transcript_text(await tr.generate_transcript(channel, appeal))
+    assert "line 99" in text and "line 100" not in text
+    assert "[Transcript truncated after 100 messages]" in text
+
+
+@pytest.mark.asyncio
+async def test_closing_inconclusive_ticket_posts_transcript_once(monkeypatch):
+    import views.appeal_actions as aa
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(aa.asyncio, "sleep", lambda s: real_sleep(0))
+    posted = []
+
+    class Target:
+        async def send(self, **kwargs):
+            posted.append(kwargs)
+
+    async def fake_resolve(guild, config):
+        return Target()
+
+    async def fake_generate(channel, appeal):
+        posted_status.append(appeal["status"])
+        return "file"
+
+    posted_status = []
+    monkeypatch.setattr(aa, "resolve_transcripts_channel", fake_resolve)
+    monkeypatch.setattr(aa, "generate_transcript", fake_generate)
+    monkeypatch.setattr(aa, "build_transcript_embed", lambda *a, **k: "embed")
+    aa._closing_channels.clear()
+
+    db = TicketDB("closed")                     # inconclusive verdict
+    view = aa.AppealActionsView(SimpleNamespace(db=db))
+    inter = _ticket_interaction()
+    await view.close_ticket.callback(inter)
+    assert len(posted) == 1 and posted_status == ["closed"]
+    assert db.transitions == []                 # status left as-is
+
+    await view.close_ticket.callback(_ticket_interaction())   # double click
+    assert len(posted) == 1
+
+
+@pytest.mark.asyncio
+async def test_closing_verdict_ticket_transcript_shows_new_status(monkeypatch):
+    import views.appeal_actions as aa
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(aa.asyncio, "sleep", lambda s: real_sleep(0))
+    seen = []
+
+    class Target:
+        async def send(self, **kwargs):
+            pass
+
+    async def fake_resolve(guild, config):
+        return Target()
+
+    async def fake_generate(channel, appeal):
+        seen.append(appeal["status"])
+        return "file"
+    monkeypatch.setattr(aa, "resolve_transcripts_channel", fake_resolve)
+    monkeypatch.setattr(aa, "generate_transcript", fake_generate)
+    monkeypatch.setattr(aa, "build_transcript_embed", lambda *a, **k: "embed")
+
+    view = aa.AppealActionsView(SimpleNamespace(db=TicketDB("rejected")))
+    await view.close_ticket.callback(_ticket_interaction())
+    assert seen == ["actioned_close"]
+
+
+class InfoDB:
+    def __init__(self, status):
+        self.appeal = {
+            "id": 12, "guild_id": 100, "status": status, "platform": "Discord",
+            "roblox_username": "u", "discord_tag": "u", "appellant_id": 42,
+            "ban_reason": "", "appeal_reason": "please", "closes_at": None,
+            "created_at": None,
+        }
+
+    async def get_appeal(self, appeal_id):
+        return dict(self.appeal)   # asyncpg.Record supports [] and .get like a dict
+
+    async def get_vote_tally(self, appeal_id):
+        return {"unban": 3, "keep_banned": 0}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,expect_panel", [
+    ("accepted", True), ("rejected", True), ("voting", False), ("actioned_unban", False),
+])
+async def test_appealinfo_offers_verdict_buttons_only_for_unactioned_verdicts(status, expect_panel):
+    from cogs.appeals import AppealsCog
+    from views.verdict_panel import VerdictPanelView
+    sent = []
+
+    class Followup:
+        async def send(self, **kwargs):
+            sent.append(kwargs)
+
+    inter = interaction(member(manage_guild=True))
+    inter.followup = Followup()
+    cog = AppealsCog(SimpleNamespace(db=InfoDB(status)))
+    await cog.appeal_info.callback(cog, inter, 12)
+    view = sent[0].get("view")
+    assert isinstance(view, VerdictPanelView) is expect_panel
+    if expect_panel:
+        assert view._appeal_id_override == 12
+    # Empty ban reason no longer produces an empty (Discord-rejected) field.
+    assert all(f.value for f in sent[0]["embed"].fields)
