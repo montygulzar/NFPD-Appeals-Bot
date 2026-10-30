@@ -21,6 +21,10 @@ from config import (
 
 logger = logging.getLogger("appeals-bot.tickets")
 
+# Ticket channels whose close is in progress in this process (double-click guard
+# for closes that have no conditional status transition to rely on).
+_closing_channels: set[int] = set()
+
 
 class AppealActionsView(discord.ui.View):
     """Staff-facing buttons inside the private ticket channel.
@@ -165,12 +169,23 @@ class AppealActionsView(discord.ui.View):
             # can't be overwritten and a double click can't post twice.
             if status == "open":
                 changed = await db.transition_status(appeal_id, ["open"], "closed")
+                new_status = "closed"
             elif status in ("accepted", "rejected"):
                 changed = await db.transition_status(appeal_id, ["accepted", "rejected"], "actioned_close")
+                new_status = "actioned_close"
+            elif status == "closed":
+                # Inconclusive vote (or closed earlier): no status to change, but
+                # the ticket still needs its transcript - the vote and any
+                # evidence in this channel would otherwise be lost on delete.
+                # The in-process guard stops a double click posting it twice.
+                changed = interaction.channel.id not in _closing_channels
+                new_status = "closed"
             else:
-                changed = False  # already closed/actioned: just remove the channel
+                changed = False  # already actioned: transcript was posted then
 
             if changed:
+                _closing_channels.add(interaction.channel.id)
+                appeal = dict(appeal, status=new_status)
                 config = await db.get_guild_config(interaction.guild_id)
                 target = await resolve_transcripts_channel(interaction.guild, config)
                 if target is None:

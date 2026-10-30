@@ -120,7 +120,11 @@ class VerdictPanelView(discord.ui.View):
             allowed_mentions=discord.AllowedMentions(users=False, roles=False, everyone=False),
         )
         await _dm_unbanned(self.bot, appeal)
-        await _close_ticket_channel(self.bot, appeal, closed_by=interaction.user, reason="Appeal accepted - unban executed")
+        # Pass the new status so the transcript header doesn't say "Accepted".
+        await _close_ticket_channel(
+            self.bot, dict(appeal, status="actioned_unban"),
+            closed_by=interaction.user, reason="Appeal accepted - unban executed",
+        )
 
     @discord.ui.button(label="Close Ticket", style=discord.ButtonStyle.secondary, custom_id="verdict:close_ticket")
     async def close_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -147,7 +151,10 @@ class VerdictPanelView(discord.ui.View):
         except discord.HTTPException:
             pass
         await interaction.followup.send(f"Appeal {appeal_id} closed by {interaction.user.mention}.", ephemeral=False)
-        await _close_ticket_channel(self.bot, appeal, closed_by=interaction.user, reason="Verdict actioned")
+        await _close_ticket_channel(
+            self.bot, dict(appeal, status="actioned_close"),
+            closed_by=interaction.user, reason="Verdict actioned",
+        )
 
     def _resolve_appeal_id(self, message: discord.Message) -> int | None:
         if self._appeal_id_override:

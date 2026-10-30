@@ -144,8 +144,9 @@ class AppealsCog(commands.Cog):
         embed.add_field(name="Discord", value=appeal["discord_tag"], inline=True)
         embed.add_field(name="Appellant", value=f"<@{appeal['appellant_id']}>", inline=True)
 
-        embed.add_field(name="Reason for Ban", value=appeal["ban_reason"], inline=False)
-        embed.add_field(name="Appeal Statement", value=appeal["appeal_reason"], inline=False)
+        # Discord rejects an embed with an empty field value.
+        embed.add_field(name="Reason for Ban", value=appeal["ban_reason"] or "—", inline=False)
+        embed.add_field(name="Appeal Statement", value=appeal["appeal_reason"] or "—", inline=False)
 
         total = tally["unban"] + tally["keep_banned"]
         vote_bar = _build_vote_bar(tally["unban"], tally["keep_banned"])
@@ -159,14 +160,32 @@ class AppealsCog(commands.Cog):
         )
 
         if appeal["closes_at"]:
+            verb = "Closes" if status == "voting" else "Closed"
             embed.add_field(
                 name="Voting Window",
-                value=f"Closes <t:{int(appeal['closes_at'].timestamp())}:R>",
+                value=f"{verb} <t:{int(appeal['closes_at'].timestamp())}:R>",
                 inline=True,
             )
 
         embed.set_footer(text=f"Submitted  •  Appeal ID: {appeal_id}")
         embed.timestamp = appeal["created_at"]
+
+        # A verdict that hasn't been actioned yet gets its Execute Unban /
+        # Close Ticket buttons here too. Otherwise, if the posted verdict
+        # message is deleted, or a crash happened before it was posted (crash
+        # recovery deliberately doesn't re-post it), staff would have no way
+        # to action the appeal at all.
+        if status in ("accepted", "rejected"):
+            from views.verdict_panel import VerdictPanelView
+            embed.add_field(
+                name="Verdict not yet actioned",
+                value="Use the buttons below if the original verdict message is missing.",
+                inline=False,
+            )
+            await interaction.followup.send(
+                embed=embed, view=VerdictPanelView(self.bot, appeal_id), ephemeral=True,
+            )
+            return
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 

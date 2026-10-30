@@ -38,6 +38,11 @@ async def resolve_transcripts_channel(
     return None
 
 
+# Was a silent 500; long tickets lost their ending. Still bounded so one huge
+# channel can't build an unbounded file in memory.
+TRANSCRIPT_MESSAGE_LIMIT = 5000
+
+
 async def generate_transcript(channel: discord.TextChannel, appeal: dict) -> discord.File:
     lines = [
         "NFPD Ban Appeals - Ticket Transcript",
@@ -51,8 +56,13 @@ async def generate_transcript(channel: discord.TextChannel, appeal: dict) -> dis
         "",
     ]
 
+    count = 0
     try:
-        async for message in channel.history(limit=500, oldest_first=True):
+        async for message in channel.history(limit=TRANSCRIPT_MESSAGE_LIMIT + 1, oldest_first=True):
+            count += 1
+            if count > TRANSCRIPT_MESSAGE_LIMIT:
+                lines.append(f"[Transcript truncated after {TRANSCRIPT_MESSAGE_LIMIT} messages]")
+                break
             ts = message.created_at.strftime("%Y-%m-%d %H:%M")
             author = f"{message.author} [BOT]" if message.author.bot else str(message.author)
             content = message.content or ""
@@ -60,6 +70,11 @@ async def generate_transcript(channel: discord.TextChannel, appeal: dict) -> dis
                 title = embed.title or ""
                 desc = (embed.description or "")[:300]
                 content += f"\n  [Embed] {title}: {desc}" if title else f"\n  [Embed] {desc}"
+            # Appellants often post screenshots as evidence; record them rather
+            # than silently dropping them. (Discord may expire these links once
+            # the ticket channel is deleted, so the filename is kept as well.)
+            for attachment in message.attachments:
+                content += f"\n  [Attachment] {attachment.filename}: {attachment.url}"
             if content.strip():
                 lines.append(f"[{ts}] {author}: {content.strip()}")
     except discord.HTTPException:

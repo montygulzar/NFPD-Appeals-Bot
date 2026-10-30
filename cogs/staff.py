@@ -83,8 +83,14 @@ class StaffCog(commands.Cog):
             )
         except Exception:
             logger.exception("force_end_voting failed for appeal %s", appeal_id)
+            # The failure may have happened after the vote was claimed, in which
+            # case the verdict is already decided and recorded - the automatic
+            # recovery pass finishes it within ~5 minutes. Retrying now would
+            # only report "already finalised".
             await interaction.followup.send(
-                "The database call failed while finalising this appeal. Please try again.",
+                f"Something went wrong while finalising appeal #{appeal_id}. If the vote was already "
+                "closed, the bot finishes it automatically within about 5 minutes - check "
+                f"`/appealinfo {appeal_id}` then. If it still shows Voting, try again.",
                 ephemeral=True,
             )
             return
